@@ -1,0 +1,18 @@
+spring:
+  application:
+    name: jd-resume-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/callback_jdresume
+    username: ${DB_USERNAME:callback_admin}
+    password: ${DB_PASSWORD:callback_password123}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+
+server:
+  port: 8082

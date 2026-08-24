@@ -7,6 +7,9 @@ target/
 ### JWT signing key (never commit the private key) ###
 auth-service/src/main/resources/keys/private_key.pem
 
+### Local file storage (jd-resume-service dev-only uploads) ###
+jd-resume-service/data/
+
 ### IntelliJ IDEA ###
 .idea/modules.xml
 .idea/jarRepositories.xml
