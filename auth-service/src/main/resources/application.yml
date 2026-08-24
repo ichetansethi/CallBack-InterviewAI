@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: auth-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/callback_auth
+    username: ${DB_USERNAME:callback_admin}
+    password: ${DB_PASSWORD:callback_password123}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+
+server:
+  port: 8081
+
+jwt:
+  expiration-ms: 86400000
