@@ -1,8 +1,0 @@
-Senior Backend Engineer - Nimbus Systems
-
-We are hiring a Senior Backend Engineer to own our order-processing and inventory services.
-Requirements:
-- 5+ years building backend systems in Java, ideally with Spring Boot.
-- Experience designing PostgreSQL schemas and operating services in Kubernetes on AWS.
-- Comfortable with Kafka-based event-driven architectures and on-call rotations.
-- Bonus: experience mentoring junior engineers.
