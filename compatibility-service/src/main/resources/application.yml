@@ -1,0 +1,40 @@
+spring:
+  application:
+    name: compatibility-service
+  datasource:
+    url: jdbc:postgresql://localhost:5433/callback_compatibility
+    username: ${DB_USERNAME:callback_admin}
+    password: ${DB_PASSWORD:callback_password123}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  ai:
+    model:
+      chat: openai
+      embedding: ollama
+    ollama:
+      base-url: http://localhost:11434
+      embedding:
+        model: nomic-embed-text
+      init:
+        pull-model-strategy: never
+    openai:
+      base-url: https://api.groq.com/openai
+      api-key: ${GROQ_API_KEY}
+      chat:
+        options:
+          model: openai/gpt-oss-120b
+          temperature: 0.2
+    vectorstore:
+      pgvector:
+        initialize-schema: true
+        dimensions: 768
+        index-type: hnsw
+        distance-type: cosine-distance
+
+server:
+  port: 8083
+
+jd-resume-service:
+  base-url: http://localhost:8082
