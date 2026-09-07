@@ -26,6 +26,18 @@ public class JobDescriptionService {
     }
 
     public JobDescriptionResponse getById(UUID id, String callerEmail) {
+        return toResponse(findOwned(id, callerEmail));
+    }
+
+    public String getRawText(UUID id, String callerEmail) {
+        return findOwned(id, callerEmail).getRawText();
+    }
+
+    public List<JobDescriptionResponse> listForUser(String ownerEmail) {
+        return repository.findByOwnerEmail(ownerEmail).stream().map(this::toResponse).toList();
+    }
+
+    private JobDescription findOwned(UUID id, String callerEmail) {
         JobDescription jd = repository.findById(id)
                 .orElseThrow(() -> new JobDescriptionNotFoundException(id));
 
@@ -34,11 +46,7 @@ public class JobDescriptionService {
             throw new JobDescriptionNotFoundException(id);
         }
 
-        return toResponse(jd);
-    }
-
-    public List<JobDescriptionResponse> listForUser(String ownerEmail) {
-        return repository.findByOwnerEmail(ownerEmail).stream().map(this::toResponse).toList();
+        return jd;
     }
 
     private JobDescriptionResponse toResponse(JobDescription jd) {

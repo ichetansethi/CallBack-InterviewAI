@@ -35,6 +35,9 @@ public class Resume {
     @Column(nullable = false)
     private Instant uploadedAt;
 
+    @Column(columnDefinition = "TEXT")
+    private String extractedText; // best-effort text extraction; null if unsupported type or extraction failed
+
     protected Resume() {}
 
     public Resume(String ownerEmail, String originalFilename, String storageKey, String contentType, long fileSizeBytes) {
@@ -72,5 +75,13 @@ public class Resume {
 
     public Instant getUploadedAt() {
         return uploadedAt;
+    }
+
+    public String getExtractedText() {
+        return extractedText;
+    }
+
+    public void setExtractedText(String extractedText) {
+        this.extractedText = extractedText;
     }
 }

@@ -32,6 +32,11 @@ public class ResumeController {
         return service.getMetadata(id, currentEmail());
     }
 
+    @GetMapping(value = "/{id}/text", produces = MediaType.TEXT_PLAIN_VALUE)
+    public String getText(@PathVariable("id") UUID id) {
+        return service.getExtractedText(id, currentEmail());
+    }
+
     @GetMapping
     public List<ResumeResponse> list() {
         return service.listForUser(currentEmail());

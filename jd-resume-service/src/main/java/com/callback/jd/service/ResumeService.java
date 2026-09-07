@@ -23,26 +23,37 @@ public class ResumeService {
 
     private final ResumeRepository repository;
     private final FileStorageService fileStorageService;
+    private final TextExtractionService textExtractionService;
 
-    public ResumeService(ResumeRepository repository, FileStorageService fileStorageService) {
+    public ResumeService(ResumeRepository repository, FileStorageService fileStorageService, TextExtractionService textExtractionService) {
         this.repository = repository;
         this.fileStorageService = fileStorageService;
+        this.textExtractionService = textExtractionService;
     }
 
     public ResumeResponse upload(MultipartFile file, String ownerEmail) {
         validate(file);
         String storageKey = fileStorageService.store(file, ownerEmail);
         Resume resume = new Resume(ownerEmail, file.getOriginalFilename(), storageKey, file.getContentType(), file.getSize());
+        resume.setExtractedText(textExtractionService.extractText(file));
         return toResponse(repository.save(resume));
     }
 
     public ResumeResponse getMetadata(UUID id, String callerEmail) {
+        return toResponse(findOwned(id, callerEmail));
+    }
+
+    public String getExtractedText(UUID id, String callerEmail) {
+        return findOwned(id, callerEmail).getExtractedText();
+    }
+
+    private Resume findOwned(UUID id, String callerEmail) {
         Resume resume = repository.findById(id)
                 .orElseThrow(() -> new ResumeNotFoundException(id));
         if (!resume.getOwnerEmail().equals(callerEmail)) {
             throw new ResumeNotFoundException(id); // same 404-for-both pattern as JD
         }
-        return toResponse(resume);
+        return resume;
     }
 
     public List<ResumeResponse> listForUser(String ownerEmail) {
