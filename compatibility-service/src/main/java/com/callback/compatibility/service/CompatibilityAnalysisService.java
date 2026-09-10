@@ -3,6 +3,7 @@ package com.callback.compatibility.service;
 import com.callback.compatibility.DTO.AnalyzeResponse;
 import com.callback.compatibility.DTO.SuggestionResponse;
 import com.callback.compatibility.client.JdResumeServiceClient;
+import com.callback.compatibility.exception.CompatibilityAnalysisNotFoundException;
 import com.callback.compatibility.model.AnalysisSuggestion;
 import com.callback.compatibility.model.CompatibilityAnalysis;
 import com.callback.compatibility.rag.RagRetrievalService;
@@ -81,6 +82,24 @@ public class CompatibilityAnalysisService {
 
         CompatibilityAnalysis saved = repository.save(analysis);
         return toResponse(saved);
+    }
+
+    public AnalyzeResponse getById(UUID id, String callerEmail) {
+        return toResponse(findOwned(id, callerEmail));
+    }
+
+    private CompatibilityAnalysis findOwned(UUID id, String callerEmail) {
+        CompatibilityAnalysis analysis = repository.findById(id)
+                .orElseThrow(() -> new CompatibilityAnalysisNotFoundException(id));
+
+        if (!analysis.getOwnerEmail().equals(callerEmail)) {
+            // deliberately the SAME exception as "doesn't exist" — mirrors
+            // JobDescriptionService.findOwned in jd-resume-service, to avoid leaking existence
+            // of another user's analysis.
+            throw new CompatibilityAnalysisNotFoundException(id);
+        }
+
+        return analysis;
     }
 
     private AnalyzeResponse toResponse(CompatibilityAnalysis analysis) {

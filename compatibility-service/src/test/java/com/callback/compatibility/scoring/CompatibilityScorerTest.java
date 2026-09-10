@@ -14,14 +14,17 @@ import static org.assertj.core.api.Assertions.assertThat;
  * recordJudgment/submitScores tools rather than answer in prose — a passing test proves the tool
  * round-trip works, not just that the model said something plausible.
  *
- * <p>Assertions are scoped to what this local 3B model reliably delivers, established empirically
- * across many runs this session: it reliably (a) never returns a suggestion with blank content —
- * CompatibilityScorer rejects and retries a supported=false judgment with no suggestion text, and
- * (b) reliably flags an evidence-free requirement as a gap. It does NOT reliably avoid flagging a
- * well-evidenced requirement too (observed false positives on borderline-phrased requirements like
- * "Kubernetes/AWS operations" even with clear matching evidence) — that is a genuine judgment-
- * precision ceiling of this model, not a tool-calling or plumbing defect, so tests don't assert
- * perfect precision there.
+ * <p>Originally scoped to a local 3B model (llama3.2:3b), which reliably (a) never returned a
+ * suggestion with blank content — CompatibilityScorer rejects and retries a supported=false
+ * judgment with no suggestion text — and (b) reliably flagged an evidence-free requirement as a
+ * gap, but did NOT reliably avoid flagging a well-evidenced requirement too (observed false
+ * positives on borderline-phrased requirements like "Kubernetes/AWS operations" even with clear
+ * matching evidence). After switching to Groq's openai/gpt-oss-120b, that precision ceiling is
+ * gone: re-run empirically on 2026-09-10, the well-covered case below now judges all four
+ * requirements (including Kubernetes/AWS and Kafka) as met, with zero false-positive suggestions.
+ * Assertions still don't hard-require perfect precision on the well-covered case, since this is a
+ * non-deterministic model call, but the earlier "expect occasional false positives" framing no
+ * longer reflects observed behavior.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
 class CompatibilityScorerTest {
@@ -51,9 +54,9 @@ class CompatibilityScorerTest {
 
         System.out.println("Well-covered result: " + result);
         assertScoresInRange(result);
-        // Every requirement here has clear, direct evidence. The model doesn't reliably avoid
-        // flagging one of these as a gap anyway (see class doc), but whenever it does, the
-        // suggestion must be genuine, specific text — never blank/decorative.
+        // Every requirement here has clear, direct evidence. Groq's model now reliably avoids
+        // flagging any of these as a gap (see class doc), but if a future run ever does, the
+        // suggestion must still be genuine, specific text — never blank/decorative.
         result.suggestions().forEach(s -> assertThat(s.suggestion()).isNotBlank());
     }
 
