@@ -5,6 +5,25 @@ and the reasoning behind the non-obvious decisions. Update this file whenever th
 architecture changes — new endpoints, new security rules, changed conventions — so it
 stays a reliable map of the service instead of going stale.
 
+## Where this fits in the system
+
+`auth-service` is the only service that holds the RS256 private key and the only one with a
+users table — every other service in this system trusts the tokens it issues without ever
+calling it directly. The other services, each with their own `ARCHITECTURE.md` following this
+same format:
+
+- **`common-security`** — the shared JWT-verification module every other service (including this
+  one) depends on. Start there for how the public/private key split and the two request filters
+  (servlet vs. reactive) work across the whole system.
+- **`jd-resume-service`** — stores job descriptions and resumes, extracts text from uploaded
+  PDF/DOCX files.
+- **`compatibility-service`** — scores a resume against a JD (Groq for chat/tool-calling, Ollama
+  for local embeddings, pgvector for RAG).
+- **`question-service`** — generates interview questions from a JD and (optionally) a
+  compatibility analysis.
+- **`voice-orchestrator`** — the real-time voice interview pipeline (WebFlux + WebSocket, Redis
+  session state, whisper.cpp/Piper for speech, Groq for turn decisions).
+
 ## Request flow (registration → login → authenticated call)
 
 ```
@@ -58,6 +77,15 @@ auth-service/src/main/resources/keys/private_key.pem      ← never committed (.
   anyway; the trade-off is that a deleted/deactivated user's still-unexpired token keeps working
   until it expires (no live revocation check), which is the standard trade-off for stateless
   multi-service JWT verification.
+- **As of the `voice-orchestrator` addition, this filter is annotated
+  `@ConditionalOnClass(Filter.class)`** and `common-security` now ships a second, sibling filter —
+  `ReactiveJwtAuthenticationFilter`, a WebFlux `WebFilter` built for voice-orchestrator's
+  reactive/WebSocket stack, which cannot load a servlet `Filter` at all. Both filters call the
+  exact same `JwtValidator` bean documented below; only the transport-layer wrapper differs. This
+  doesn't change anything about how auth-service itself works — it's still the same
+  `JwtAuthenticationFilter` wired via `SecurityConfig` below — but auth-service is no longer the
+  only kind of consumer this shared filter has to serve. See `common-security/ARCHITECTURE.md`
+  for the full story of why two filters exist and how each service wires (or auto-wires) them.
 - **auth-service depends on `common-security` too**, and `AuthController.login()` calls
   `jwtValidator.extractExpiration(token)` on the token it just signed, rather than re-deriving
   `now + expirationMs` locally. This means the issuer verifies through the exact same public-key
