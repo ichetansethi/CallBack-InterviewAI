@@ -58,6 +58,24 @@
             <artifactId>jakarta.servlet-api</artifactId>
             <scope>provided</scope>
         </dependency>
+
+        <!-- Compile-only, same pattern as jakarta.servlet-api above: lets this module compile
+             ReactiveJwtAuthenticationFilter without forcing the reactive stack onto every
+             consumer's runtime classpath. Only a service that already declares its own
+             spring-boot-starter-webflux (like voice-orchestrator) actually gets it at runtime. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- For @ConditionalOnWebApplication, guarding each filter so it only activates on the
+             web stack it's written for — see JwtAuthenticationFilter / ReactiveJwtAuthenticationFilter. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+            <scope>provided</scope>
+        </dependency>
     </dependencies>
 
 </project>

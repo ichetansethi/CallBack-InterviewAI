@@ -1,0 +1,24 @@
+spring:
+  application:
+    name: voice-orchestrator
+  data:
+    redis:
+      host: localhost
+      port: 6379
+  ai:
+    openai:
+      base-url: https://api.groq.com/openai
+      api-key: ${GROQ_API_KEY}
+      chat:
+        options:
+          model: openai/gpt-oss-120b
+          temperature: 0.2
+
+server:
+  port: 8085
+
+whisper:
+  base-url: http://localhost:8090
+
+piper:
+  base-url: http://localhost:8091

@@ -44,5 +44,6 @@
     <module>jd-resume-service</module>
     <module>compatibility-service</module>
     <module>question-service</module>
+    <module>voice-orchestrator</module>
   </modules>
 </project>
