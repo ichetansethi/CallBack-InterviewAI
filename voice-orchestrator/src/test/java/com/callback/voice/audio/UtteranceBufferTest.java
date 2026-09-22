@@ -27,11 +27,30 @@ class UtteranceBufferTest {
         }
         assertThat(endOfUtterance).isFalse();
 
-        for (int i = 0; i < 40 && !endOfUtterance; i++) { // up to 800ms silence
+        for (int i = 0; i < 85 && !endOfUtterance; i++) { // up to 1700ms silence (SILENCE_HOLD_MS = 1500)
             endOfUtterance = buffer.append(silentChunk(20));
         }
 
         assertThat(endOfUtterance).isTrue();
+    }
+
+    @Test
+    void doesNotFlagEndOfUtteranceOnAMidThoughtPauseUnderTheHoldThreshold() {
+        // Regression test for a live-tested bug: a candidate pausing ~1.2s mid-sentence to think
+        // was previously flushed as end-of-utterance (SILENCE_HOLD_MS was 700ms). A pause under
+        // the current 1500ms threshold must not flush, so speech resuming after it is still part
+        // of the same utterance.
+        boolean endOfUtterance = false;
+        for (int i = 0; i < 20; i++) { // 400ms speech
+            endOfUtterance = buffer.append(loudChunk(20));
+        }
+        for (int i = 0; i < 60; i++) { // 1200ms thinking pause — under SILENCE_HOLD_MS
+            endOfUtterance = buffer.append(silentChunk(20));
+        }
+        assertThat(endOfUtterance).isFalse();
+
+        endOfUtterance = buffer.append(loudChunk(20)); // candidate resumes speaking
+        assertThat(endOfUtterance).isFalse();
     }
 
     @Test

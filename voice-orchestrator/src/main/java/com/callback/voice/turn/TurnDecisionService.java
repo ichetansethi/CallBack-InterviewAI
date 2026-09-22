@@ -36,6 +36,14 @@ public class TurnDecisionService {
     private static final Logger log = LoggerFactory.getLogger(TurnDecisionService.class);
     private static final int MAX_ATTEMPTS = 4;
 
+    // The exchange number below which the interview must not end, and the one by which it should
+    // have. These are told to the model explicitly in the prompt (see buildTurnPrompt) rather than
+    // left as vague prose ("roughly 5-8 exchanges") for it to infer by counting the rendered
+    // transcript itself — live testing showed the model never ended on its own without an explicit
+    // number to compare against, only when the candidate gave it an explicit verbal cue instead.
+    private static final int MIN_EXCHANGES_BEFORE_END = 6;
+    private static final int TARGET_MAX_EXCHANGES = 8;
+
     /** See CompatibilityScorer.MODEL_CALL_TIMEOUT for why this exists — guards against a runaway
      * tool-call repetition loop hanging the exchange indefinitely. */
     private static final Duration MODEL_CALL_TIMEOUT = Duration.ofSeconds(30);
@@ -65,9 +73,16 @@ public class TurnDecisionService {
                 callWithTimeout(() -> chatClient.prompt()
                         .system("""
                                 You are conducting a mock interview. Decide whether to ask a follow-up
-                                question based on the candidate's last answer, or advance to the next
-                                prepared question. Respond only via a tool call, never in plain text:
-                                call submitTurnDecision exactly once.""")
+                                question based on the candidate's last answer, advance to the next
+                                prepared question, or end the interview with a closing remark. The
+                                user message tells you the current exchange number — use that number,
+                                don't count the transcript yourself. Never end before exchange %d, even
+                                if you feel you already have enough. From exchange %d onward, end with
+                                a closing remark as soon as you have a well-rounded picture of the
+                                candidate rather than continuing to probe. By exchange %d, end
+                                regardless, even if you'd like to ask more. Respond only via a tool
+                                call, never in plain text: call submitTurnDecision exactly once.
+                                """.formatted(MIN_EXCHANGES_BEFORE_END, MIN_EXCHANGES_BEFORE_END, TARGET_MAX_EXCHANGES))
                         .user(buildTurnPrompt(transcript, state))
                         .tools(recorder)
                         .call()
@@ -82,16 +97,21 @@ public class TurnDecisionService {
             } catch (RuntimeException e) {
                 lastFailure = e;
                 log.warn("Turn decision attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, e.toString());
-                backoffBeforeRetry();
+                backoffBeforeRetry(e);
             }
         }
         throw new IllegalStateException("Model failed to produce a valid turn decision after "
                 + MAX_ATTEMPTS + " attempts", lastFailure);
     }
 
-    private void backoffBeforeRetry() {
+    /** Backs off before a retry — longer if the failure looks like a rate limit, so the retry loop
+     * doesn't just immediately re-hit the same limit within the same window. Same pattern as
+     * CompatibilityScorer.backoffBeforeRetry in compatibility-service. */
+    private void backoffBeforeRetry(RuntimeException failure) {
+        String message = String.valueOf(failure.getMessage());
+        long millis = (message.contains("429") || message.toLowerCase().contains("rate_limit")) ? 12000 : 300;
         try {
-            Thread.sleep(300);
+            Thread.sleep(millis);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -118,6 +138,11 @@ public class TurnDecisionService {
     }
 
     static String buildTurnPrompt(String transcript, InterviewSessionState state) {
+        // The decision being made now covers the exchange that will become turnCount+1 once this
+        // turn is saved (state.turnCount() is how many turns are already committed, i.e. how many
+        // happened before this one).
+        int currentExchangeNumber = state.turnCount() + 1;
+
         String history = state.history().isEmpty()
                 ? "(none yet — this is the candidate's first response)"
                 : state.history().stream()
@@ -125,11 +150,13 @@ public class TurnDecisionService {
                         .collect(Collectors.joining("\n---\n"));
 
         return """
+                CURRENT EXCHANGE NUMBER: %d
+
                 CONVERSATION SO FAR:
                 %s
 
                 CANDIDATE'S LATEST ANSWER (transcribed from speech):
-                %s""".formatted(history, transcript);
+                %s""".formatted(currentExchangeNumber, history, transcript);
     }
 
 }

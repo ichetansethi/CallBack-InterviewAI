@@ -149,7 +149,8 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
         // successfully.
         return turnDecisionService.decideNextTurn(transcript, current)
                 .flatMap(decision -> textToSpeechStreamer.speak(session, decision.responseText())
-                        .then(saveTurn(current, transcript, decision, stateRef)))
+                        .then(saveTurn(current, transcript, decision, stateRef))
+                        .then(closeIfInterviewEnded(session, decision)))
                 .then();
     }
 
@@ -157,6 +158,19 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
                                                   TurnDecision decision, AtomicReference<InterviewSessionState> stateRef) {
         InterviewSessionState updated = current.withTurn(new TurnRecord(transcript, decision.action(), decision.responseText()));
         return sessionRepository.save(updated).doOnNext(stateRef::set);
+    }
+
+    // The model closes out the interview itself via the "end" action (see TurnDecisionRecorder).
+    // Closing here — after its closing remark has already been spoken and the turn saved — is what
+    // makes the session reach a clean end state instead of the connection just sitting open
+    // indefinitely once the interview is logically over.
+    private Mono<Void> closeIfInterviewEnded(WebSocketSession session, TurnDecision decision) {
+        if (!"end".equalsIgnoreCase(decision.action())) {
+            return Mono.empty();
+        }
+        log.info("Interview ended by model decision on session {}; closing connection.",
+                session.getHandshakeInfo().getUri());
+        return session.close(CloseStatus.NORMAL);
     }
 
 }

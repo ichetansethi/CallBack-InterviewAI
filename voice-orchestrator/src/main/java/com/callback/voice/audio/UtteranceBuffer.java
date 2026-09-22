@@ -13,8 +13,17 @@ public class UtteranceBuffer {
     private static final int SAMPLE_RATE_HZ = 16_000;
     private static final int BYTES_PER_SAMPLE = 2;
 
-    // How long trailing silence must hold before the utterance counts as finished.
-    private static final long SILENCE_HOLD_MS = 700;
+    // How long trailing silence must hold before the utterance counts as finished. Confirmed via
+    // live testing that 700ms was too short: a candidate pausing mid-thought to think for over
+    // 700ms (a normal, natural pause) got flushed as if they were done talking, producing two
+    // fragmentary utterances and an interviewer response to a half-formed sentence. Raised to
+    // 1500ms — comfortably past a natural thinking pause without being long enough to feel like a
+    // dead connection. Trade-off: this adds up to ~800ms more latency to every genuine end-of-turn
+    // detection, on top of the pipeline's own STT/decision/TTS latency (see ARCHITECTURE.md,
+    // "Audio processing details" and "Testing" sections). A fixed energy-based VAD threshold can't
+    // fully solve this — telling "still thinking" from "done talking" from silence duration alone
+    // is inherently a guess; a semantic/ML VAD is the real fix, not attempted here.
+    private static final long SILENCE_HOLD_MS = 1500;
 
     // Guards against flushing on leading silence before the candidate has said anything.
     private static final long MIN_SPEECH_MS_BEFORE_FLUSH = 300;

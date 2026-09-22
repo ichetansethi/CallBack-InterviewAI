@@ -21,8 +21,9 @@ public class TurnDecisionRecorder {
 
     @Tool(description = "Submit the interviewer's next-turn decision. Call exactly once.")
     public String submitTurnDecision(
-            @ToolParam(description = "Either 'follow_up' (probe the candidate's last answer further) "
-                    + "or 'advance' (move on to the next prepared question)")
+            @ToolParam(description = "One of: 'follow_up' (probe the candidate's last answer further), "
+                    + "'advance' (move on to the next prepared question), or 'end' (conclude the interview "
+                    + "with a closing remark — use this once you've covered enough ground, not before)")
             String action,
             @ToolParam(description = "The exact text the interviewer should say next")
             String responseText) {

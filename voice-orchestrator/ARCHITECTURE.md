@@ -116,9 +116,10 @@ processTurn(session, transcript, stateRef)
    │        (Groq tool call — see "Turn decision" below)
    ├─▶ TextToSpeechStreamer.speak(session, decision.responseText())
    │        splits into sentences, synthesizes + streams each in order (see "TTS streaming" below)
-   └─▶ ONLY after speech has been fully handed to the WebSocket:
-          sessionRepository.save(current.withTurn(new TurnRecord(transcript, action, responseText)))
-          stateRef.set(saved)
+   ├─▶ ONLY after speech has been fully handed to the WebSocket:
+   │      sessionRepository.save(current.withTurn(new TurnRecord(transcript, action, responseText)))
+   │      stateRef.set(saved)
+   └─▶ if action == "end": session.close(CloseStatus.NORMAL) — see "Reaching a clean end state" below
 ```
 
 ### Why the save happens after the speech is sent, not before
@@ -150,9 +151,26 @@ Explicitly documented as *"the simplest viable version — a proper ML VAD model
 not a blocker for a working pipeline."*
 
 ### `UtteranceBuffer`
-`MIN_SPEECH_MS_BEFORE_FLUSH = 300`, `SILENCE_HOLD_MS = 700` — an utterance only flushes once it
+`MIN_SPEECH_MS_BEFORE_FLUSH = 300`, `SILENCE_HOLD_MS = 1500` — an utterance only flushes once it
 has accumulated real speech and then held silence for a sustained period, avoiding both
 premature flushing on brief pauses and flushing on pure background silence.
+
+**`SILENCE_HOLD_MS` was originally 700ms; live end-to-end testing found this too short.** A
+candidate pausing ~1.2s mid-sentence to think (a normal pause, not a stopping point) was flushed
+as end-of-utterance: the pipeline transcribed the fragment before the pause, the interviewer
+generated and spoke a response to that half-formed sentence, and the rest of the candidate's
+answer became a second, disconnected turn. Confirmed via `redis-cli` on the session state:
+`turnCount` incremented twice for what was semantically one answer, with two fragmentary
+transcripts instead of one coherent one. Raised to 1500ms, which comfortably exceeds a natural
+thinking pause; a regression test
+(`UtteranceBufferTest.doesNotFlagEndOfUtteranceOnAMidThoughtPauseUnderTheHoldThreshold`) pins this.
+**Trade-off, stated plainly**: this adds up to ~800ms of latency to every genuine end-of-turn
+detection — see "Real end-to-end latency" below, where median measured latency was already ~1.9s
+before this change, so the true end-to-end number is now higher. A fixed energy-based silence
+threshold fundamentally can't distinguish "still thinking" from "done talking" — raising the
+number trades false positives (premature cutoffs) for slower turn-taking, it doesn't eliminate the
+underlying ambiguity. A semantic/ML VAD (or a pause-fillers-aware heuristic) is the real fix, not
+attempted here.
 
 ### `WavEncoder`
 Prepends a standard 44-byte PCM WAV header (RIFF/WAVE/fmt /data chunks) to raw PCM bytes — no
@@ -176,7 +194,13 @@ public TurnDecisionService(ChatClient.Builder chatClientBuilder) {
   class is used from voice-orchestrator's reactive WebSocket pipeline and must never block a
   Netty event loop thread."* This is the one place a blocking Spring AI call is deliberately
   shifted off the reactive thread pool.
-- **`MAX_ATTEMPTS = 4`**, flat 300ms backoff between attempts (`backoffBeforeRetry`).
+- **`MAX_ATTEMPTS = 4`**, rate-limit-aware backoff between attempts (`backoffBeforeRetry`): ~12s if
+  the failure message contains `"429"`/`"rate_limit"`, ~300ms otherwise. Originally a flat 300ms
+  regardless of failure type — a gap relative to `CompatibilityScorer.backoffBeforeRetry` in
+  compatibility-service, which already had this distinction (see
+  [[local_model_reliability_findings]]: *"Rate limits interact badly with retry-without-backoff...
+  immediately retrying a 429 just re-hits the same limit"*). Brought into parity so a burst of
+  Groq free-tier rate limiting doesn't burn through all 4 attempts in under a second.
 - **`MODEL_CALL_TIMEOUT = Duration.ofSeconds(30)`**, enforced via a dedicated cached daemon-thread
   executor (`"turn-decision-model-call"`) and `Future.get(timeout)`. The class's own comment
   cross-references `CompatibilityScorer.MODEL_CALL_TIMEOUT` in compatibility-service directly —
@@ -195,12 +219,69 @@ public TurnDecisionService(ChatClient.Builder chatClientBuilder) {
   `MAX_ATTEMPTS` is exhausted: `IllegalStateException("Model failed to produce a valid turn
   decision after 4 attempts", lastFailure)`, which propagates up through the reactive chain and is
   caught by `VoiceWebSocketHandler`'s `.onErrorResume` (the fallback error-message path).
-- `TurnDecision{action, responseText}` — `action` is either `"follow_up"` or `"advance"` per the
-  tool parameter's description; this is validated only by the prompt instruction, not enforced in
-  code as an enum.
+- `TurnDecision{action, responseText}` — `action` is one of `"follow_up"`, `"advance"`, or `"end"`
+  per the tool parameter's description; this is validated only by the prompt instruction, not
+  enforced in code as an enum.
 - The prompt renders the full turn history (`state.history()`) as alternating `"Candidate: ..."` /
   `"Interviewer: ..."` lines, plus the latest transcript, as the user message — so every decision
   is made with the full conversation-so-far in context, not just the latest utterance.
+
+## Reaching a clean end state
+
+Originally there was no way for an interview to end on its own: `action` only ever meant
+`"follow_up"` or `"advance"`, no question-set concept existed anywhere in this service (no call to
+question-service), and no code path ever closed the connection based on interview progress — it
+just stayed open until the client disconnected or an unhandled error occurred. Confirmed as a real
+gap via live testing, not assumed.
+
+Fixed by adding a third action, `"end"`: the system prompt instructs the model to end the
+interview with a closing remark once it's covered enough ground. `VoiceWebSocketHandler.processTurn`
+speaks that closing remark and saves the final turn exactly as any other turn, then — only after
+both have succeeded — `closeIfInterviewEnded` calls `session.close(CloseStatus.NORMAL)`. Closing
+after speech has been sent (not before) keeps the same "commit after delivery" discipline the rest
+of `processTurn` already follows.
+
+**Verified live** (three separate sessions): the model only chose `"end"` when the candidate gave
+an explicit verbal cue ("I don't have anything else to add" / "that's everything from my side") —
+never spontaneously from context alone in an initial test. Each time, the WebSocket closed with
+code **1000 (normal closure)**, confirmed by forcing a subsequent send into the closed socket and
+observing `ConnectionClosedOK: received 1000 (OK)` client-side.
+
+### Why it didn't end on its own at first, and the fix for that
+
+The original prompt told the model "roughly 5-8 substantive exchanges is typically enough" in
+prose, but never told it the actual exchange number — `buildTurnPrompt` only rendered the
+conversation as unstructured `"Candidate: ... \nInterviewer: ..."` text. For the model to know it
+was on exchange 8, it would have had to accurately count conversational pairs embedded in that
+prose itself, which is unreliable for a model tuned for fast, low-temperature tool-calling. Across
+8 organic turns in testing, it never did — every decision was `"follow_up"` until an explicit
+candidate cue forced `"end"`.
+
+Fixed by making the exchange number an explicit fact instead of something to infer:
+`TurnDecisionService.buildTurnPrompt` now computes `currentExchangeNumber = state.turnCount() + 1`
+and puts it as the first line of the user message (`CURRENT EXCHANGE NUMBER: %d`). The system
+prompt references two named constants instead of vague prose: `MIN_EXCHANGES_BEFORE_END = 6` (the
+model is told never to end before this exchange, no matter how confident it feels) and
+`TARGET_MAX_EXCHANGES = 8` (the model is told to end by this exchange regardless). Between 6 and
+8, it's told to end as soon as it has a well-rounded picture rather than continuing to probe. This
+is still prompt-level guidance, not a hard enforcement in code — nothing forces `action = "end"` at
+exchange 8 if the model disregards the instruction, so a runaway interview that ignores the prompt
+is still theoretically possible. **This specific change (turn count in the prompt) has not yet been
+re-verified live** — the three "end" confirmations above predate it and relied on an explicit
+candidate cue, not the exchange-count mechanism. Re-test before relying on it to end unprompted.
+
+**Deliberately not built**: a hard code-level cap (e.g. force `action = "end"` once
+`state.turnCount()` reaches some ceiling regardless of what the model returns) would make this
+fully bulletproof, but that's a separate, more invasive change — not implied by "tell the model the
+turn count," and not added without a deliberate decision to trade model judgment for a hard
+guarantee.
+
+**What this deliberately doesn't do**: there is still no question-set exhaustion concept — this
+service has no integration with question-service and doesn't track a target number of questions.
+The model decides when to end purely from the conversation so far, the same way it already decides
+`"advance"` without any actual prepared question list. If a hard question-count cap or
+question-service integration is wanted later, that's a separate, larger feature, not implied by
+this fix.
 
 ---
 
@@ -224,6 +305,32 @@ public TurnDecisionService(ChatClient.Builder chatClientBuilder) {
   response. This is forward-looking infrastructure for if/when `TurnDecisionService` streams its
   output token-by-token instead of returning a single blocking string — not dead code to remove,
   but not on the active code path today.
+
+---
+
+## HTTP clients to Whisper and Piper — buffer size and timeouts
+
+`WhisperClientConfig`/`PiperClientConfig` each build their `WebClient` with explicit
+`ReactorClientHttpConnector`-backed settings, not WebFlux's defaults. Both gaps below were found
+via live end-to-end testing against real local whisper.cpp/Piper servers, not by inspection.
+
+- **Response buffer size (`PiperClientConfig` only)**: WebFlux's default in-memory buffer cap for
+  a fully-buffered response body (`bodyToMono(byte[].class)`, as `PiperClient.synthesize` uses) is
+  256KB. A single synthesized sentence's raw audio can exceed that — hit in testing as
+  `DataBufferLimitException: Exceeded limit on max bytes to buffer : 262144`, which `processTurn`'s
+  `onErrorResume` treated identically to Piper being down (fallback message, turn not committed) —
+  except Piper was actually healthy the whole time. Raised to 10MB via
+  `ExchangeStrategies.builder().codecs(...).maxInMemorySize(...)`, comfortably past any realistic
+  one-sentence clip.
+- **Response/connect timeouts (both clients)**: neither `WebClient` had any timeout configured
+  before. A backend that's fully down (nothing listening on the port) fails the connection
+  quickly — confirmed for both whisper.cpp-down and Piper-down, fallback message delivered in
+  roughly 1-2s. But a backend that's *alive and unresponsive* (process hung, not crashed) had no
+  timeout guard at all and could have stalled a turn indefinitely with no fallback ever firing —
+  the same class of failure as `TurnDecisionService.MODEL_CALL_TIMEOUT` guards against for the
+  Groq call, just previously unguarded on this side of the pipeline. Both clients now set a 3s
+  connect timeout and a 15s response timeout via a `reactor.netty.http.client.HttpClient`, generous
+  headroom over real local inference/synthesis time for one utterance or one sentence.
 
 ---
 
@@ -387,13 +494,31 @@ and no reactive WebSocket integration test of `VoiceWebSocketHandler` itself.
 | `SentenceBoundaryBufferTest` | Streaming deltas emit a sentence exactly on terminal punctuation; a never-terminated trailing fragment flushes on source completion; empty source produces nothing |
 | `SentenceSplitterTest` | Splits on terminal punctuation; punctuation-less input stays one "sentence"; blank input → empty list |
 
-No test exists for `TurnDecisionService`/`TurnDecisionRecorder` (would require mocking
+No automated test exists for `TurnDecisionService`/`TurnDecisionRecorder` (would require mocking
 `ChatClient`), `InterviewSessionRepository`/`InterviewSessionState` (would need embedded Redis or
 a fake `ReactiveRedisTemplate`), `WhisperClient`/`PiperClient` (would need WireMock), the
 WebSocket handler itself (would need a reactive WebSocket test client), or either JWT filter in
-common-security. There is no "verified manually" table for this service the way auth-service's
-doc has one for its own flow — this would need a real end-to-end run against local Whisper, Piper,
-Redis, and Groq to produce honestly, and hasn't been done as part of writing this document.
+common-security. That gap is still real — everything below was verified by hand, once, against a
+real local stack, not by a repeatable test suite.
+
+### Manually verified, end-to-end (real whisper.cpp, Piper, Redis, Groq — this session only)
+
+| Scenario | Result |
+|---|---|
+| Multi-turn happy path: connect, several turns, transcript accuracy (via `redis-cli`), audible TTS | Pass |
+| Missing / invalid / expired token on handshake → rejected | Pass (WS close code 1003) |
+| Valid token for a different user, same `sessionId` → rejected | Pass (ownership check works) |
+| Piper down → fallback error frame, turn not committed | Pass |
+| whisper.cpp down → fallback error frame, turn not committed, no hang | Pass |
+| Kill + restart voice-orchestrator mid-session, reconnect same `sessionId` | Pass — history and `turnCount` survived in Redis, next turn showed continuity |
+| Two concurrent sessions (different users) | Pass — separate Redis keys, correct `ownerEmail` each, no cross-contamination |
+| Short single-word utterance ("Yes") | Pass — VAD flushes correctly, one turn |
+| Mid-sentence thinking pause (~1.2s) | **Failed before the `SILENCE_HOLD_MS` fix** — utterance split into two turns. Fixed and re-verified: 1200ms pause (under the new 1500ms threshold) → 1 turn, no split; 1800ms pause (over threshold) → 2 turns, split still occurs as intended |
+| Real end-to-end turn latency (candidate stops talking → audio starts) | Pre-fix (`SILENCE_HOLD_MS=700`): median ~1.9s, range 1.8-2.4s (9 samples). Post-fix (`SILENCE_HOLD_MS=1500`): median ~3.1s, range 2.5-4.5s (6 samples) — confirms the ~800ms-plus latency cost of the pause fix is real |
+| Clean interview end state | Was entirely missing (no `"end"` action existed); added and verified live across 3 sessions — model chose `"end"` on an explicit candidate cue each time, WebSocket closed with code 1000 (normal closure) each time. The later turn-count-in-prompt change (see "Reaching a clean end state") has **not yet** been re-verified live |
+
+This table is a point-in-time record of one manual pass, not a substitute for the automated tests
+this section still lacks — update or re-verify it the next time this pipeline is tested live.
 
 ---
 
@@ -415,6 +540,14 @@ Redis, and Groq to produce honestly, and hasn't been done as part of writing thi
    the current code path is the non-streaming `speak()`/`SentenceSplitter` combination.
 5. **`SessionHistoryPersister` is a placeholder** slated for deletion once `session-history-service`
    exists — don't build durability logic into it; build the real service instead.
+6. **The interview end condition is prompt-driven, not enforced in code.** The model decides when
+   to emit `"end"`, now guided by an explicit exchange number in the prompt
+   (`MIN_EXCHANGES_BEFORE_END = 6`, `TARGET_MAX_EXCHANGES = 8` in `TurnDecisionService`) rather than
+   vague prose — but there is still no hard turn-count cap enforced in code, and no question-service
+   integration. If either is added later, update "Reaching a clean end state" above.
+7. **`SILENCE_HOLD_MS` (1500ms) is a deliberately imperfect trade-off**, not a solved problem — see
+   "Audio processing details" above. Don't casually lower it back toward 700ms without re-running
+   the mid-thought-pause test that caught the original bug.
 
 ---
 
