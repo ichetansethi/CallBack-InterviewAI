@@ -8,12 +8,14 @@ reliable map of the service instead of going stale.
 ## What this service is
 
 A real-time voice interview pipeline. A client opens one WebSocket connection
-(`/voice/session`), streams raw PCM audio chunks up, and this service transcribes each utterance
-(local whisper.cpp), decides the interviewer's next move via an LLM tool call (Groq, through
-Spring AI's OpenAI-compatible client), synthesizes the response as speech (local Piper), and
-streams the resulting audio back — sentence by sentence, so playback can start before the whole
-response has finished synthesizing. Session/conversation state (the running transcript) lives in
-Redis for the life of the connection plus a 2-hour TTL.
+(`/voice/session?token=<jwt>&questionSetId=<uuid>`), streams raw PCM audio chunks up, and this
+service transcribes each utterance (local whisper.cpp), decides the interviewer's next move via an
+LLM tool call (Groq, through Spring AI's OpenAI-compatible client) — grounded in a prepared
+question list fetched once from question-service at connect time — synthesizes the response as
+speech (local Piper), and streams the resulting audio back — sentence by sentence, so playback can
+start before the whole response has finished synthesizing. Session/conversation state (the running
+transcript, plus the question list and progress through it) lives in Redis for the life of the
+connection plus a 2-hour TTL.
 
 **This is not a proxy to OpenAI's realtime voice API.** Despite the pom comment and the
 `spring-ai-starter-model-openai` dependency name, the "OpenAI-compatible client" here is pointed
@@ -43,7 +45,7 @@ common-security/ARCHITECTURE.md for the full story of why a servlet `Filter` can
 ## Connection / auth flow
 
 ```
-Client → WebSocket upgrade GET /voice/session?token=<JWT>&sessionId=<optional-uuid>
+Client → WebSocket upgrade GET /voice/session?token=<JWT>&questionSetId=<uuid>
       │
       ▼
 WebSocketConfig's SimpleUrlHandlerMapping (order=-1, so it's matched ahead of any future
@@ -53,21 +55,49 @@ WebSocketConfig's SimpleUrlHandlerMapping (order=-1, so it's matched ahead of an
 VoiceWebSocketHandler.handle(session)
       1. token = query param "token"
          if missing or !jwtValidator.isValid(token) → session.close(NOT_ACCEPTABLE)
-      2. ownerEmail = jwtValidator.extractEmail(token)
-      3. sessionId = "sessionId" query param, or a freshly minted UUID if absent
-      4. sessionRepository.loadOrCreate(sessionId, ownerEmail)  — Redis GET, or create+save if absent
-         if the loaded/created state's ownerEmail != token's email → session.close(NOT_ACCEPTABLE)
-             ("a client can resume a sessionId only if its JWT matches the email the session was
-              created under — otherwise anyone who guesses/observes an id could rehydrate
-              someone else's interview state")
-      5. send text ack frame: {"sessionId":"<id>"}
-      6. session.receive().concatMap(handleIncomingAudioChunk) — per-connection audio pipeline begins
+      2. questionSetId = query param "questionSetId", parsed as a UUID
+         if missing or not a valid UUID → session.close(NOT_ACCEPTABLE)
+      3. ownerEmail = jwtValidator.extractEmail(token)
+      4. sessionId = ownerEmail + "::" + questionSetId   — see "Session identity" below, this
+         replaced a client-supplied sessionId query param
+      5. questionServiceClient.getQuestionSet(questionSetId, "Bearer " + token)
+         — GET to question-service (see "Question-service integration" below); a 404 (question
+           set doesn't exist OR isn't owned by this token — question-service deliberately returns
+           the same 404 for both) → session.close(NOT_ACCEPTABLE); any other failure (401, 5xx,
+           timeout, connection refused) → session.close(SERVER_ERROR), logged
+      6. sessionRepository.loadOrCreate(sessionId, ownerEmail, fetchedQuestions)
+         — Redis GET, or create+save with the fetched question list if absent. On a genuine resume
+           (session already existed), the freshly-fetched question list is discarded in favor of
+           what's already persisted — see InterviewSessionState's javadoc for why.
+      7. send text ack frame: {"sessionId":"<id>"}
+      8. session.receive().concatMap(handleIncomingAudioChunk) — per-connection audio pipeline begins
 ```
 
 **This handler authenticates itself independently of `ReactiveJwtAuthenticationFilter`** — it
 injects `JwtValidator` directly and never reads `ReactiveSecurityContextHolder`. See "Security
 wiring" below for why the global filter still runs on every request (including this handshake)
 but currently has no consumer in this service.
+
+### Session identity — no longer a client-supplied id
+
+Originally a client could pass `?sessionId=<uuid>` to resume a specific prior interview, or omit
+it to get a freshly minted one. That's gone: **the resumable identity of an interview is now
+`(ownerEmail, questionSetId)`**, computed server-side as `sessionId = ownerEmail + "::" +
+questionSetId`. Reconnecting with the same token and the same `questionSetId` always lands on the
+same Redis-stored session — there's no separate id for the client to track, store, or pass back.
+
+This is deliberately different from a raw ownership check on a client-chosen id (the old
+`state.ownerEmail().equals(ownerEmail)` comparison is gone because it's now structurally
+impossible to violate): since the key itself embeds `ownerEmail`, a different user can never even
+compute the same key, let alone collide with someone else's session, regardless of whether they
+guess or observe a `questionSetId`. The actual authorization boundary is enforced by
+question-service's own ownership check on every connect (step 5 above) — this service doesn't
+independently re-verify anything beyond trusting that response, which is a deliberate delegation
+of that check, not an oversight.
+
+One consequence worth knowing: this ties one `questionSetId` to exactly one interview attempt per
+candidate. There's no way to represent "retake this same question set" — that would need its own
+distinct identifier (e.g. an attempt id), not implied by anything built here.
 
 ### Message protocol
 - **Inbound**: binary frames only, expected to be 16 kHz / 16-bit signed little-endian mono PCM.
@@ -77,6 +107,38 @@ but currently has no consumer in this service.
   (one per synthesized sentence, streamed as Piper returns them), or — on a turn-processing
   failure — a text error frame: `{"type":"error","message":"Sorry, something went wrong — could
   you repeat that?"}`.
+
+---
+
+## Question-service integration
+
+`QuestionServiceClient` (a small `WebClient` wrapper, same shape as `WhisperClient`/`PiperClient`)
+calls question-service's `GET /questions/{id}` once per connection, during the handshake — see
+"Connection / auth flow" above. This is what finally gives `TurnDecisionService`'s `"advance"`
+action a real question to advance to; previously (see "Turn decision" below) there was no prepared
+question list anywhere in this service, which was a likely reason the model never chose `advance`
+in testing — it had nothing concrete to advance toward.
+
+- **DTOs** (`QuestionSetDto`, `InterviewQuestionDto`) mirror question-service's own
+  `QuestionSetResponse`/`InterviewQuestionResponse` field-for-field (`id`, `jdId`, `createdAt`,
+  `questions[]` of `{category, questionText, rationale}`). Array order is the only ordering
+  signal — question-service sorts server-side by its own `orderIndex` before responding, but
+  doesn't expose that index in the response; this service just trusts array order.
+- **Ownership is delegated, not re-checked here.** question-service's own `QuestionSetService`
+  enforces that the question set belongs to the caller (matching the JWT subject), returning 404
+  for both "doesn't exist" and "exists but isn't yours" — deliberately the same response for both,
+  to avoid leaking which is which (same pattern as compatibility-service's own `findOwned`). Only
+  that 404 is folded into `QuestionSetNotFoundException` here; a 401 (bad/expired forwarded token)
+  is deliberately left as a distinct, generically-logged failure rather than being mislabeled as
+  "not found" — collapsing them would hide a real auth-forwarding bug behind a misleading message.
+- **Timeout**: 3s connect / 15s response, same reasoning and same mechanism
+  (`ReactorClientHttpConnector` + `reactor.netty.http.client.HttpClient`) as
+  `WhisperClientConfig`/`PiperClientConfig` — this call happens before anything else in the
+  connection, so a hang here is worse than a hang mid-conversation: the candidate never even gets
+  an ack.
+- **Not yet live-verified.** Everything in this section compiles and unit-tests cleanly, but hasn't
+  been exercised against a running question-service as part of a real WebSocket connection yet —
+  do that before relying on it.
 
 ---
 
@@ -214,11 +276,33 @@ public TurnDecisionService(ChatClient.Builder chatClientBuilder) {
   `CompatibilityScorer` and question-service's `QuestionGenerationService` — see
   [[local_model_reliability_findings]].
 - Failure modes that trigger a retry: the model doesn't call the tool at all
-  (`IllegalStateException("Model did not call submitTurnDecision")`), or calls it with a blank
-  `responseText` (`IllegalStateException("Model submitted a blank responseText")`). After
-  `MAX_ATTEMPTS` is exhausted: `IllegalStateException("Model failed to produce a valid turn
-  decision after 4 attempts", lastFailure)`, which propagates up through the reactive chain and is
-  caught by `VoiceWebSocketHandler`'s `.onErrorResume` (the fallback error-message path).
+  (`IllegalStateException("Model did not call submitTurnDecision")`), calls it with a blank
+  `responseText`, or returns an `action` outside `{follow_up, advance, end}` (case-insensitive) —
+  this last check was added alongside the question-service integration below, since `action` now
+  drives real business logic (advancing `currentQuestionIndex`), not just prose the model happens
+  to produce. After `MAX_ATTEMPTS` is exhausted: `IllegalStateException("Model failed to produce a
+  valid turn decision after 4 attempts", lastFailure)`, which propagates up through the reactive
+  chain and is caught by `VoiceWebSocketHandler`'s `.onErrorResume` (the fallback error-message
+  path).
+
+### Question-set-aware prompting
+
+`buildTurnPrompt` now includes, in addition to the exchange number (see "Reaching a clean end
+state" below): the current prepared question's category and text, and — if there is one — the
+*next* prepared question's category and text, or an explicit "this is the last prepared question,
+end instead of advancing" instruction if there isn't. This directly addresses a finding from live
+testing: `"advance"` previously had no concrete question to advance to anywhere in the prompt, and
+the model was observed to never choose it. Giving it a real next question, and explicitly telling
+it when there's nothing left, is meant to fix that — **not yet re-verified live** (see "Testing"
+below).
+
+`InterviewSessionState.withTurn` clamps `currentQuestionIndex` at the last valid index regardless
+of what the model returns, as a deterministic safety net — if the model says `"advance"` while
+already on the last question despite being told not to, the index simply doesn't move past the end
+(and the exchange-count cap still applies as a second, independent path to `"end"`). This is a
+different mechanism from the exchange-count guidance: running out of prepared questions is an
+objective fact this service can enforce in code, not something worth leaving purely to the model's
+judgment.
 - `TurnDecision{action, responseText}` — `action` is one of `"follow_up"`, `"advance"`, or `"end"`
   per the tool parameter's description; this is validated only by the prompt instruction, not
   enforced in code as an enum.
@@ -341,20 +425,28 @@ with a plain `StringRedisSerializer` for keys and a `Jackson2JsonRedisSerializer
 app's own auto-configured `ObjectMapper`) for values.
 
 `InterviewSessionRepository`:
-- Key format: `"voice:session:" + sessionId`.
+- Key format: `"voice:session:" + sessionId`, where `sessionId` is now `ownerEmail + "::" +
+  questionSetId` (see "Session identity" above) — no longer a client-supplied or randomly
+  generated UUID.
 - `TTL = Duration.ofHours(2)`, **refreshed on every save** (a sliding TTL, not fixed-from-creation)
   — comment: *"Bounds how long an abandoned session lingers in Redis; refreshed on every save so
   an active interview never expires mid-conversation."*
-- `loadOrCreate(sessionId, ownerEmail)` — `GET`, and if empty, creates and saves a fresh
-  `InterviewSessionState.newSession(...)`.
+- `loadOrCreate(sessionId, ownerEmail, questions)` — `GET`, and if empty, creates and saves a
+  fresh `InterviewSessionState.newSession(...)` seeded with the question list fetched from
+  question-service for this connection. If a session already exists, the passed-in `questions` are
+  discarded — the persisted list wins, so an interview's questions can't silently change mid-way
+  even if question-service's own data changes later.
 
 Redis here **is** the store of the interview transcript for the life of the connection (and up to
 2 hours after) — not a cache in front of some other database. `InterviewSessionState.history` is
 a `List<TurnRecord>`; `TurnRecord{transcript, action, responseText}` is one full turn: what the
 candidate said, what the interviewer decided to do, and what it said back.
+`InterviewSessionState.questions` is the prepared question list (fetched once, at creation, from
+question-service) and `currentQuestionIndex` is this service's own progress cursor into it —
+question-service itself has no "current question" concept, only a flat ordered list.
 `InterviewSessionState.withTurn(...)` returns a new immutable state (copy-on-write of the history
-list) with an incremented `turnCount` and bumped `updatedAt` — no in-place mutation of persisted
-state.
+list) with an incremented `turnCount`, `currentQuestionIndex` advanced (and clamped) if the turn's
+action was `"advance"`, and bumped `updatedAt` — no in-place mutation of persisted state.
 
 ### The known, documented persistence gap
 
@@ -411,8 +503,11 @@ together cleanly is nontrivial — the handler doing its own check is the pragma
 that, not an oversight.
 
 **The actual authorization-relevant checks for this service's one real endpoint are entirely
-in `VoiceWebSocketHandler`**: token validity, and the session-ownership check comparing the
-token's email against the session's stored `ownerEmail` in Redis before allowing a resume.
+in `VoiceWebSocketHandler`**: token validity, and (since the session-identity change in "Session
+identity" above) trusting question-service's own per-`questionSetId` ownership check on every
+connect — there's no separate in-Redis ownership comparison anymore, because the
+`ownerEmail + "::" + questionSetId` key makes a cross-owner collision structurally impossible
+rather than something to check for after the fact.
 
 ---
 
@@ -434,6 +529,12 @@ token's email against the session's stored `ownerEmail` in Redis before allowing
   uses (`UsernamePasswordAuthenticationToken`, `ReactiveSecurityContextHolder`, `WebFilter`)
   arrives transitively through `common-security`'s own (non-`provided`) `spring-security-web`
   dependency — this service never chose a security starter itself.
+- **No new dependency was needed for `QuestionServiceClient`.** It's a plain `WebClient` built the
+  same way `WhisperClient`/`PiperClient` are, using `reactor-netty-http` (for the connect/response
+  timeout wiring) that already arrives transitively via `spring-boot-starter-webflux`. voice-
+  orchestrator and question-service are separate deployable services communicating over HTTP —
+  there is no compile-time dependency between them, and `QuestionSetNotFoundException` here is
+  this service's own local class, not question-service's internal one of the same idea.
 
 ---
 
@@ -461,6 +562,9 @@ whisper:
   base-url: http://localhost:8090
 piper:
   base-url: http://localhost:8091
+services:
+  question-service:
+    base-url: http://localhost:8084
 ```
 
 - `spring.data.redis.host`/`port` — targets the `redis:7-alpine` container added by
@@ -475,6 +579,8 @@ piper:
   `WhisperClientConfig`/`PiperClientConfig`'s respective `WebClient` beans. These point at local
   server-mode instances of whisper.cpp and Piper — infrastructure entirely outside Spring AI's
   model abstractions.
+- `services.question-service.base-url` — same `@Value`-into-`WebClient` pattern, injected into
+  `QuestionServiceClient`. Port `8084` matches question-service's own `application.yml`.
 - No `spring.data.redis.password`, no Redis SSL/timeout tuning, no actuator/management
   configuration — deliberately minimal, dev-focused config.
 
@@ -493,13 +599,14 @@ and no reactive WebSocket integration test of `VoiceWebSocketHandler` itself.
 | `WavEncoderTest` | Every header field verified byte-for-byte; PCM payload appended unchanged after the header |
 | `SentenceBoundaryBufferTest` | Streaming deltas emit a sentence exactly on terminal punctuation; a never-terminated trailing fragment flushes on source completion; empty source produces nothing |
 | `SentenceSplitterTest` | Splits on terminal punctuation; punctuation-less input stays one "sentence"; blank input → empty list |
+| `InterviewSessionStateTest` | `"advance"` moves `currentQuestionIndex` forward; `"follow_up"` leaves it unchanged; repeated `"advance"` past the last question clamps rather than going out of bounds; an empty question list leaves the index at 0 |
 
 No automated test exists for `TurnDecisionService`/`TurnDecisionRecorder` (would require mocking
-`ChatClient`), `InterviewSessionRepository`/`InterviewSessionState` (would need embedded Redis or
-a fake `ReactiveRedisTemplate`), `WhisperClient`/`PiperClient` (would need WireMock), the
-WebSocket handler itself (would need a reactive WebSocket test client), or either JWT filter in
-common-security. That gap is still real — everything below was verified by hand, once, against a
-real local stack, not by a repeatable test suite.
+`ChatClient`), `InterviewSessionRepository` (would need embedded Redis or a fake
+`ReactiveRedisTemplate`), `WhisperClient`/`PiperClient`/`QuestionServiceClient` (would need
+WireMock), the WebSocket handler itself (would need a reactive WebSocket test client), or either
+JWT filter in common-security. That gap is still real — everything below was verified by hand,
+once, against a real local stack, not by a repeatable test suite.
 
 ### Manually verified, end-to-end (real whisper.cpp, Piper, Redis, Groq — this session only)
 
@@ -507,7 +614,8 @@ real local stack, not by a repeatable test suite.
 |---|---|
 | Multi-turn happy path: connect, several turns, transcript accuracy (via `redis-cli`), audible TTS | Pass |
 | Missing / invalid / expired token on handshake → rejected | Pass (WS close code 1003) |
-| Valid token for a different user, same `sessionId` → rejected | Pass (ownership check works) |
+| Valid token for a different user, same `sessionId` → rejected | Pass at the time — but this predates the session-identity change in "Session identity" above (the explicit `ownerEmail` comparison this test exercised no longer exists; a different user now structurally can't compute the same key at all). **Not yet re-verified under the new mechanism.** |
+| Question-service integration: fetching a real question set, `"advance"` moving through it, running out of questions ending the interview | **Not yet built or tested when the above was verified — added afterward, not yet exercised live at all.** See "Question-service integration" and "Question-set-aware prompting" above. |
 | Piper down → fallback error frame, turn not committed | Pass |
 | whisper.cpp down → fallback error frame, turn not committed, no hang | Pass |
 | Kill + restart voice-orchestrator mid-session, reconnect same `sessionId` | Pass — history and `turnCount` survived in Redis, next turn showed continuity |
@@ -540,12 +648,20 @@ this section still lacks — update or re-verify it the next time this pipeline 
    the current code path is the non-streaming `speak()`/`SentenceSplitter` combination.
 5. **`SessionHistoryPersister` is a placeholder** slated for deletion once `session-history-service`
    exists — don't build durability logic into it; build the real service instead.
-6. **The interview end condition is prompt-driven, not enforced in code.** The model decides when
-   to emit `"end"`, now guided by an explicit exchange number in the prompt
-   (`MIN_EXCHANGES_BEFORE_END = 6`, `TARGET_MAX_EXCHANGES = 8` in `TurnDecisionService`) rather than
-   vague prose — but there is still no hard turn-count cap enforced in code, and no question-service
-   integration. If either is added later, update "Reaching a clean end state" above.
-7. **`SILENCE_HOLD_MS` (1500ms) is a deliberately imperfect trade-off**, not a solved problem — see
+6. **The interview end condition now has two independent paths, one prompt-driven and one
+   code-enforced.** The model can choose `"end"` on its own judgment, guided by an explicit
+   exchange number in the prompt (`MIN_EXCHANGES_BEFORE_END = 6`, `TARGET_MAX_EXCHANGES = 8` in
+   `TurnDecisionService`) — that part is still prompt-level guidance the model could disregard.
+   Separately, `InterviewSessionState.withTurn` clamps `currentQuestionIndex` at the last question
+   regardless of what the model says, which is a hard, deterministic guarantee for "ran out of
+   prepared questions" specifically. Neither path has been re-verified live since the
+   question-service integration landed — see "Testing" above.
+7. **Session identity changed from a client-supplied id to `ownerEmail + "::" + questionSetId`.**
+   There is no more `sessionId` query param — a WS connection now requires `questionSetId`
+   instead, and question-service must be reachable during every handshake (see "Question-service
+   integration"). Don't reintroduce a free-standing client-chosen `sessionId` without also
+   reconciling how it'd interact with this identity scheme.
+8. **`SILENCE_HOLD_MS` (1500ms) is a deliberately imperfect trade-off**, not a solved problem — see
    "Audio processing details" above. Don't casually lower it back toward 700ms without re-running
    the mid-thought-pause test that caught the original bug.
 

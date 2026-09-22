@@ -22,3 +22,7 @@ whisper:
 
 piper:
   base-url: http://localhost:8091
+
+services:
+  question-service:
+    base-url: http://localhost:8084

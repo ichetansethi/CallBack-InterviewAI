@@ -1,5 +1,6 @@
 package com.callback.voice.turn;
 
+import com.callback.voice.DTO.InterviewQuestionDto;
 import com.callback.voice.DTO.TurnDecision;
 import com.callback.voice.session.InterviewSessionState;
 import org.slf4j.Logger;
@@ -10,6 +11,8 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -56,6 +59,8 @@ public class TurnDecisionService {
 
     private final ChatClient chatClient;
 
+    private static final Set<String> VALID_ACTIONS = Set.of("follow_up", "advance", "end");
+
     public TurnDecisionService(ChatClient.Builder chatClientBuilder) {
         this.chatClient = chatClientBuilder.build();
     }
@@ -74,14 +79,18 @@ public class TurnDecisionService {
                         .system("""
                                 You are conducting a mock interview. Decide whether to ask a follow-up
                                 question based on the candidate's last answer, advance to the next
-                                prepared question, or end the interview with a closing remark. The
-                                user message tells you the current exchange number — use that number,
-                                don't count the transcript yourself. Never end before exchange %d, even
-                                if you feel you already have enough. From exchange %d onward, end with
-                                a closing remark as soon as you have a well-rounded picture of the
-                                candidate rather than continuing to probe. By exchange %d, end
-                                regardless, even if you'd like to ask more. Respond only via a tool
-                                call, never in plain text: call submitTurnDecision exactly once.
+                                prepared question shown to you in the user message, or end the interview
+                                with a closing remark. The user message tells you the current exchange
+                                number and the current prepared question — use those, don't count the
+                                transcript yourself. Never end before exchange %d, even if you feel you
+                                already have enough. From exchange %d onward, end with a closing remark
+                                as soon as you have a well-rounded picture of the candidate rather than
+                                continuing to probe. By exchange %d, end regardless, even if you'd like
+                                to ask more. If the user message tells you this is the last prepared
+                                question and you would otherwise advance, end instead — there is nothing
+                                left to advance to, so give a closing remark, not another question.
+                                Respond only via a tool call, never in plain text: call
+                                submitTurnDecision exactly once.
                                 """.formatted(MIN_EXCHANGES_BEFORE_END, MIN_EXCHANGES_BEFORE_END, TARGET_MAX_EXCHANGES))
                         .user(buildTurnPrompt(transcript, state))
                         .tools(recorder)
@@ -92,6 +101,9 @@ public class TurnDecisionService {
                         new IllegalStateException("Model did not call submitTurnDecision"));
                 if (decision.responseText() == null || decision.responseText().isBlank()) {
                     throw new IllegalStateException("Model submitted a blank responseText");
+                }
+                if (decision.action() == null || !VALID_ACTIONS.contains(decision.action().toLowerCase())) {
+                    throw new IllegalStateException("Model submitted an unrecognized action: " + decision.action());
                 }
                 return decision;
             } catch (RuntimeException e) {
@@ -152,11 +164,35 @@ public class TurnDecisionService {
         return """
                 CURRENT EXCHANGE NUMBER: %d
 
+                %s
+
                 CONVERSATION SO FAR:
                 %s
 
                 CANDIDATE'S LATEST ANSWER (transcribed from speech):
-                %s""".formatted(currentExchangeNumber, history, transcript);
+                %s""".formatted(currentExchangeNumber, buildQuestionContext(state), history, transcript);
+    }
+
+    private static String buildQuestionContext(InterviewSessionState state) {
+        List<InterviewQuestionDto> questions = state.questions();
+        if (questions == null || questions.isEmpty()) {
+            return "PREPARED QUESTIONS: none provided for this session — use your own judgment for "
+                    + "what to ask, there is nothing to \"advance\" to.";
+        }
+
+        int index = state.currentQuestionIndex();
+        InterviewQuestionDto current = questions.get(index);
+        boolean isLastQuestion = index >= questions.size() - 1;
+
+        String progressLine = "CURRENT PREPARED QUESTION (%d of %d) [%s]: %s"
+                .formatted(index + 1, questions.size(), current.category(), current.questionText());
+
+        String nextLine = isLastQuestion
+                ? "This is the LAST prepared question. If you would advance, end the interview instead."
+                : "If you advance, the next prepared question is [%s]: %s"
+                        .formatted(questions.get(index + 1).category(), questions.get(index + 1).questionText());
+
+        return progressLine + "\n" + nextLine;
     }
 
 }

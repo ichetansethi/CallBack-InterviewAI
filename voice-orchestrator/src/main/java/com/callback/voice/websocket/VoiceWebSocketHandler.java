@@ -4,6 +4,8 @@ import com.callback.security.jwt.JwtValidator;
 import com.callback.voice.DTO.TurnDecision;
 import com.callback.voice.audio.UtteranceBuffer;
 import com.callback.voice.audio.VoiceActivityDetector;
+import com.callback.voice.client.QuestionServiceClient;
+import com.callback.voice.client.QuestionSetNotFoundException;
 import com.callback.voice.client.WhisperClient;
 import com.callback.voice.session.InterviewSessionRepository;
 import com.callback.voice.session.InterviewSessionState;
@@ -36,14 +38,15 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
     private final TurnDecisionService turnDecisionService;
     private final TextToSpeechStreamer textToSpeechStreamer;
     private final SessionHistoryPersister sessionHistoryPersister;
+    private final QuestionServiceClient questionServiceClient;
 
     public VoiceWebSocketHandler(JwtValidator jwtValidator,
-                                  InterviewSessionRepository sessionRepository,
-                                  VoiceActivityDetector voiceActivityDetector,
-                                  WhisperClient whisperClient,
-                                  TurnDecisionService turnDecisionService,
-                                  TextToSpeechStreamer textToSpeechStreamer,
-                                  SessionHistoryPersister sessionHistoryPersister) {
+                                 InterviewSessionRepository sessionRepository,
+                                 VoiceActivityDetector voiceActivityDetector,
+                                 WhisperClient whisperClient,
+                                 TurnDecisionService turnDecisionService,
+                                 TextToSpeechStreamer textToSpeechStreamer,
+                                 SessionHistoryPersister sessionHistoryPersister, QuestionServiceClient questionServiceClient) {
         this.jwtValidator = jwtValidator;
         this.sessionRepository = sessionRepository;
         this.voiceActivityDetector = voiceActivityDetector;
@@ -51,43 +54,60 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
         this.turnDecisionService = turnDecisionService;
         this.textToSpeechStreamer = textToSpeechStreamer;
         this.sessionHistoryPersister = sessionHistoryPersister;
+        this.questionServiceClient = questionServiceClient;
     }
 
     @Override
     public Mono<Void> handle(WebSocketSession session) {
         String token = extractQueryParam(session, "token");
-
         if (token == null || !jwtValidator.isValid(token)) {
-            return session.close(CloseStatus.NOT_ACCEPTABLE);
+            return session.close(CloseStatus.NOT_ACCEPTABLE.withReason("invalid token"));
         }
+
+        String questionSetIdRaw = extractQueryParam(session, "questionSetId");
+        if (questionSetIdRaw == null) {
+            return session.close(CloseStatus.NOT_ACCEPTABLE.withReason("questionSetId required"));
+        }
+        UUID questionSetId;
+        try {
+            questionSetId = UUID.fromString(questionSetIdRaw);
+        } catch (IllegalArgumentException e) {
+            return session.close(CloseStatus.NOT_ACCEPTABLE.withReason("questionSetId must be a UUID"));
+        }
+
         String ownerEmail = jwtValidator.extractEmail(token);
+        // The resumable identity of an interview is (who + which question set), not a client-chosen
+        // id: reconnecting with the same token and questionSetId always lands on the same Redis
+        // session, so there's no separate sessionId for the client to track or pass back. Because
+        // this key embeds ownerEmail, a different user can never collide with someone else's
+        // session even if they guess a questionSetId — they'd just get their own (and
+        // question-service's own ownership check below would reject them, since only the real
+        // owner's token can ever successfully fetch that question set to populate a session).
+        String sessionId = ownerEmail + "::" + questionSetId;
+        String bearerToken = "Bearer " + token;
 
-        String requestedSessionId = extractQueryParam(session, "sessionId");
-        String sessionId = (requestedSessionId == null || requestedSessionId.isBlank())
-                ? UUID.randomUUID().toString()
-                : requestedSessionId;
-
-        return sessionRepository.loadOrCreate(sessionId, ownerEmail)
-                .flatMap(state -> {
-                    // A client can resume a sessionId only if its JWT matches the email the
-                    // session was created under — otherwise anyone who guesses/observes an id
-                    // could rehydrate someone else's interview state.
-                    if (!state.ownerEmail().equals(ownerEmail)) {
-                        return session.close(CloseStatus.NOT_ACCEPTABLE);
-                    }
-
-                    AtomicReference<InterviewSessionState> stateRef = new AtomicReference<>(state);
-                    UtteranceBuffer utteranceBuffer = new UtteranceBuffer(voiceActivityDetector);
-
-                    return sendSessionAck(session, sessionId)
-                            .then(session.receive()
-                                    .concatMap(message -> handleIncomingAudioChunk(session, message, stateRef, utteranceBuffer))
-                                    .then())
-                            // Fires on normal completion, error, or cancellation alike — the one
-                            // place that reliably sees "this connection is over," regardless of
-                            // why. See SessionHistoryPersister for why this only logs for now.
-                            .doFinally(signalType -> sessionHistoryPersister.onConnectionEnded(stateRef.get()));
+        return questionServiceClient.getQuestionSet(questionSetId, bearerToken)
+                .flatMap(qs -> sessionRepository.loadOrCreate(sessionId, ownerEmail, qs.questions()))
+                .flatMap(state -> runInterview(session, state))
+                .onErrorResume(QuestionSetNotFoundException.class, e ->
+                        session.close(CloseStatus.NOT_ACCEPTABLE.withReason("question set not found or not owned")))
+                .onErrorResume(e -> {
+                    log.error("Failed to initialize session for question set {}: {}", questionSetId, e.toString());
+                    return session.close(CloseStatus.SERVER_ERROR);
                 });
+    }
+
+    private Mono<Void> runInterview(WebSocketSession session, InterviewSessionState state) {
+        AtomicReference<InterviewSessionState> stateRef = new AtomicReference<>(state);
+        UtteranceBuffer utteranceBuffer = new UtteranceBuffer(voiceActivityDetector);
+
+        return sendSessionAck(session, state.sessionId())
+                .then(session.receive()
+                        .concatMap(message -> handleIncomingAudioChunk(session, message, stateRef, utteranceBuffer))
+                        .then())
+                // Fires on normal completion, error, or cancellation alike — the one place that
+                // reliably sees "this connection is over," regardless of why.
+                .doFinally(signalType -> sessionHistoryPersister.onConnectionEnded(stateRef.get()));
     }
 
     private Mono<Void> sendSessionAck(WebSocketSession session, String sessionId) {
