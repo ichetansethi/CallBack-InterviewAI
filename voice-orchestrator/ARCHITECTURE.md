@@ -136,9 +136,34 @@ in testing — it had nothing concrete to advance toward.
   `WhisperClientConfig`/`PiperClientConfig` — this call happens before anything else in the
   connection, so a hang here is worse than a hang mid-conversation: the candidate never even gets
   an ack.
-- **Not yet live-verified.** Everything in this section compiles and unit-tests cleanly, but hasn't
-  been exercised against a running question-service as part of a real WebSocket connection yet —
-  do that before relying on it.
+- **Live-verified** (see "Testing" below) — real question sets fetched from a running
+  question-service correctly drive `"advance"`/`"end"` decisions end-to-end.
+
+### Two real bugs found and fixed by this live-testing pass
+
+Neither was caught by compilation or unit tests; both were found the moment a real connection was
+attempted.
+
+1. **`pom.xml` had a stray full `compile`-scope dependency on `question-service`** (added in the
+   same commit as this integration), even though this service only ever uses its own local
+   `QuestionSetDto`/`InterviewQuestionDto`/`QuestionServiceClient` and never imports
+   `com.callback.question.*`. Because `VoiceOrchestratorApplication` scans the widened
+   `com.callback` base package (see "Security wiring" below), this pulled question-service's JPA
+   entities and repositories onto voice-orchestrator's classpath and made Spring try to configure a
+   SQL `DataSource` for a service that has none — `APPLICATION FAILED TO START` with "Failed to
+   determine a suitable driver class" on every boot. Fixed by deleting the dependency entirely;
+   the "no compile-time dependency between them" claim in "`pom.xml` — dependencies" above is now
+   actually true again, not just documented as the intent.
+2. **question-service's `GET /questions/{id}` 500'd on every call**, not just cross-owner ones:
+   `QuestionSetController.get(@PathVariable UUID id)` never named its path variable, and this
+   service's build has no `-parameters` compiler flag, so Spring couldn't resolve the binding
+   (`IllegalArgumentException: Name for argument of type [java.util.UUID] not specified...`). Every
+   other `@PathVariable` in this codebase (`JobDescriptionController`, `ResumeController`) names it
+   explicitly (`@PathVariable("id")`); this one didn't. This is the exact call
+   `QuestionServiceClient` makes on every voice-orchestrator handshake, so until it was fixed, no
+   question-set-backed session could ever be created at all — not a cross-user edge case, a total
+   block on this entire feature. Fixed by adding the explicit name in
+   `question-service/.../QuestionSetController.java`.
 
 ---
 
@@ -293,8 +318,10 @@ state" below): the current prepared question's category and text, and — if the
 end instead of advancing" instruction if there isn't. This directly addresses a finding from live
 testing: `"advance"` previously had no concrete question to advance to anywhere in the prompt, and
 the model was observed to never choose it. Giving it a real next question, and explicitly telling
-it when there's nothing left, is meant to fix that — **not yet re-verified live** (see "Testing"
-below).
+it when there's nothing left, fixes that — **re-verified live** (see "Testing" below): across a
+7-question set, the model chose `"advance"` repeatedly, each time asking exactly the next prepared
+question's text, and correctly chose `"end"` (not another `"advance"`) once positioned on the last
+prepared question.
 
 `InterviewSessionState.withTurn` clamps `currentQuestionIndex` at the last valid index regardless
 of what the model returns, as a deterministic safety net — if the model says `"advance"` while
@@ -350,9 +377,10 @@ model is told never to end before this exchange, no matter how confident it feel
 8, it's told to end as soon as it has a well-rounded picture rather than continuing to probe. This
 is still prompt-level guidance, not a hard enforcement in code — nothing forces `action = "end"` at
 exchange 8 if the model disregards the instruction, so a runaway interview that ignores the prompt
-is still theoretically possible. **This specific change (turn count in the prompt) has not yet been
-re-verified live** — the three "end" confirmations above predate it and relied on an explicit
-candidate cue, not the exchange-count mechanism. Re-test before relying on it to end unprompted.
+is still theoretically possible. **Re-verified live** (see "Testing" below): with no explicit
+candidate cue at all, the model chose `"end"` unprompted exactly at exchange 6
+(`MIN_EXCHANGES_BEFORE_END`), with `currentQuestionIndex` still only at 3 of 6 — confirming the
+exchange-count path really is independent of, and can preempt, the question-list-exhaustion path.
 
 **Deliberately not built**: a hard code-level cap (e.g. force `action = "end"` once
 `state.turnCount()` reaches some ceiling regardless of what the model returns) would make this
@@ -614,8 +642,8 @@ once, against a real local stack, not by a repeatable test suite.
 |---|---|
 | Multi-turn happy path: connect, several turns, transcript accuracy (via `redis-cli`), audible TTS | Pass |
 | Missing / invalid / expired token on handshake → rejected | Pass (WS close code 1003) |
-| Valid token for a different user, same `sessionId` → rejected | Pass at the time — but this predates the session-identity change in "Session identity" above (the explicit `ownerEmail` comparison this test exercised no longer exists; a different user now structurally can't compute the same key at all). **Not yet re-verified under the new mechanism.** |
-| Question-service integration: fetching a real question set, `"advance"` moving through it, running out of questions ending the interview | **Not yet built or tested when the above was verified — added afterward, not yet exercised live at all.** See "Question-service integration" and "Question-set-aware prompting" above. |
+| Valid token for a different user, same `sessionId` → rejected | Superseded — see the question-set-aware row below. The old client-supplied `sessionId` no longer exists as a concept at all (see "Session identity"). |
+| **Question-service integration, full live pass (this session)**: real question set fetched at handshake; `"advance"` moves `currentQuestionIndex` through it with the exact next question's text asked each time; reaching the last prepared question turns an `"advance"`-equivalent decision into `"end"` with a real closing remark (not another question), clean WS close code 1000; exchange-count-based `"end"` (exchange 6) still fires on its own, independent of the question list, even mid-list; reconnecting with the same token + `questionSetId` after a full voice-orchestrator process kill+restart resumes the same Redis session (`turnCount`, `currentQuestionIndex`, `history` all intact); missing `questionSetId` → WS close 1003 "questionSetId required"; malformed (non-UUID) `questionSetId` → WS close 1003 "questionSetId must be a UUID"; a different user's token with someone else's real `questionSetId` → WS close 1003 "question set not found or not owned" | **Pass, all sub-scenarios** — see "Question-set-aware prompting" and "Reaching a clean end state" above for details. Required fixing two real bugs first — see "Two real bugs found and fixed by this live-testing pass" above — without which no question-set-backed session could be created at all. |
 | Piper down → fallback error frame, turn not committed | Pass |
 | whisper.cpp down → fallback error frame, turn not committed, no hang | Pass |
 | Kill + restart voice-orchestrator mid-session, reconnect same `sessionId` | Pass — history and `turnCount` survived in Redis, next turn showed continuity |
@@ -654,13 +682,17 @@ this section still lacks — update or re-verify it the next time this pipeline 
    `TurnDecisionService`) — that part is still prompt-level guidance the model could disregard.
    Separately, `InterviewSessionState.withTurn` clamps `currentQuestionIndex` at the last question
    regardless of what the model says, which is a hard, deterministic guarantee for "ran out of
-   prepared questions" specifically. Neither path has been re-verified live since the
-   question-service integration landed — see "Testing" above.
+   prepared questions" specifically. **Both paths re-verified live** since the question-service
+   integration landed — see "Testing" above: the exchange-count path fired unprompted mid-list, and
+   the question-list-exhaustion path correctly produced `"end"` once positioned on the last
+   question.
 7. **Session identity changed from a client-supplied id to `ownerEmail + "::" + questionSetId`.**
    There is no more `sessionId` query param — a WS connection now requires `questionSetId`
    instead, and question-service must be reachable during every handshake (see "Question-service
    integration"). Don't reintroduce a free-standing client-chosen `sessionId` without also
-   reconciling how it'd interact with this identity scheme.
+   reconciling how it'd interact with this identity scheme. **Live-verified**: missing/malformed
+   `questionSetId` and a different owner's real `questionSetId` are all cleanly rejected (WS close
+   1003) — see "Testing" above.
 8. **`SILENCE_HOLD_MS` (1500ms) is a deliberately imperfect trade-off**, not a solved problem — see
    "Audio processing details" above. Don't casually lower it back toward 700ms without re-running
    the mid-thought-pause test that caught the original bug.

@@ -32,7 +32,7 @@ public class QuestionSetController {
     }
 
     @GetMapping("/{id}")
-    public QuestionSetResponse get(@PathVariable UUID id) {
+    public QuestionSetResponse get(@PathVariable("id") UUID id) {
         return service.getById(id, currentEmail());
     }
 
