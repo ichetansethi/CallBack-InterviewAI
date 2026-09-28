@@ -54,16 +54,16 @@ WebSocketConfig's SimpleUrlHandlerMapping (order=-1, so it's matched ahead of an
       ▼
 VoiceWebSocketHandler.handle(session)
       1. token = query param "token"
-         if missing or !jwtValidator.isValid(token) → session.close(NOT_ACCEPTABLE)
+         if missing or !jwtValidator.isValid(token) → session.close(POLICY_VIOLATION)
       2. questionSetId = query param "questionSetId", parsed as a UUID
-         if missing or not a valid UUID → session.close(NOT_ACCEPTABLE)
+         if missing or not a valid UUID → session.close(POLICY_VIOLATION)
       3. ownerEmail = jwtValidator.extractEmail(token)
       4. sessionId = ownerEmail + "::" + questionSetId   — see "Session identity" below, this
          replaced a client-supplied sessionId query param
       5. questionServiceClient.getQuestionSet(questionSetId, "Bearer " + token)
          — GET to question-service (see "Question-service integration" below); a 404 (question
            set doesn't exist OR isn't owned by this token — question-service deliberately returns
-           the same 404 for both) → session.close(NOT_ACCEPTABLE); any other failure (401, 5xx,
+           the same 404 for both) → session.close(POLICY_VIOLATION); any other failure (401, 5xx,
            timeout, connection refused) → session.close(SERVER_ERROR), logged
       6. sessionRepository.loadOrCreate(sessionId, ownerEmail, fetchedQuestions)
          — Redis GET, or create+save with the fetched question list if absent. On a genuine resume
@@ -98,6 +98,26 @@ of that check, not an oversight.
 One consequence worth knowing: this ties one `questionSetId` to exactly one interview attempt per
 candidate. There's no way to represent "retake this same question set" — that would need its own
 distinct identifier (e.g. an attempt id), not implied by anything built here.
+
+### Rejection close code: `POLICY_VIOLATION` (1008), not `NOT_ACCEPTABLE` (1003)
+
+All four handshake-rejection paths above originally used `CloseStatus.NOT_ACCEPTABLE`, which maps
+to WebSocket close code **1003**. Found wrong during live testing (see "Testing" below): RFC 6455
+defines 1003 as *"received a type of data it cannot accept"* — the wire-level frame type (e.g.
+binary vs. text), not a business-logic rejection like a bad JWT, a malformed UUID, or "you don't
+own this resource." Spring's own `POLICY_VIOLATION` constant (code **1008**) is RFC 6455's actual
+catch-all for *"received a message that violates its policy"* and is the correct fit here — fixed
+to use that instead. (`CloseStatus.NOT_ACCEPTABLE`'s name is arguably a Spring naming footgun: it
+evokes HTTP 406, a completely different axis — content negotiation, not auth/authorization — which
+is likely what led to reaching for it originally.)
+
+This still doesn't reject at the most standard layer: a real HTTP 401/403 during the Upgrade
+request itself (before the WebSocket handshake completes) would be more universally actionable by
+proxies, load balancers, and browser devtools than any WS close code, which requires the client to
+inspect `close.code`/`close.reason` explicitly. Doing that in Spring WebFlux would mean rejecting
+earlier — a `WebFilter`/handshake interceptor ahead of `VoiceWebSocketHandler` — rather than
+accepting the upgrade and closing after the fact. Deliberately not done here; flagged as a possible
+future improvement, not a bug.
 
 ### Message protocol
 - **Inbound**: binary frames only, expected to be 16 kHz / 16-bit signed little-endian mono PCM.
@@ -641,9 +661,9 @@ once, against a real local stack, not by a repeatable test suite.
 | Scenario | Result |
 |---|---|
 | Multi-turn happy path: connect, several turns, transcript accuracy (via `redis-cli`), audible TTS | Pass |
-| Missing / invalid / expired token on handshake → rejected | Pass (WS close code 1003) |
+| Missing / invalid / expired token on handshake → rejected | Pass (WS close code 1008 — see "Rejection close code" note below) |
 | Valid token for a different user, same `sessionId` → rejected | Superseded — see the question-set-aware row below. The old client-supplied `sessionId` no longer exists as a concept at all (see "Session identity"). |
-| **Question-service integration, full live pass (this session)**: real question set fetched at handshake; `"advance"` moves `currentQuestionIndex` through it with the exact next question's text asked each time; reaching the last prepared question turns an `"advance"`-equivalent decision into `"end"` with a real closing remark (not another question), clean WS close code 1000; exchange-count-based `"end"` (exchange 6) still fires on its own, independent of the question list, even mid-list; reconnecting with the same token + `questionSetId` after a full voice-orchestrator process kill+restart resumes the same Redis session (`turnCount`, `currentQuestionIndex`, `history` all intact); missing `questionSetId` → WS close 1003 "questionSetId required"; malformed (non-UUID) `questionSetId` → WS close 1003 "questionSetId must be a UUID"; a different user's token with someone else's real `questionSetId` → WS close 1003 "question set not found or not owned" | **Pass, all sub-scenarios** — see "Question-set-aware prompting" and "Reaching a clean end state" above for details. Required fixing two real bugs first — see "Two real bugs found and fixed by this live-testing pass" above — without which no question-set-backed session could be created at all. |
+| **Question-service integration, full live pass (this session)**: real question set fetched at handshake; `"advance"` moves `currentQuestionIndex` through it with the exact next question's text asked each time; reaching the last prepared question turns an `"advance"`-equivalent decision into `"end"` with a real closing remark (not another question), clean WS close code 1000; exchange-count-based `"end"` (exchange 6) still fires on its own, independent of the question list, even mid-list; reconnecting with the same token + `questionSetId` after a full voice-orchestrator process kill+restart resumes the same Redis session (`turnCount`, `currentQuestionIndex`, `history` all intact); missing `questionSetId` → WS close 1008 "questionSetId required"; malformed (non-UUID) `questionSetId` → WS close 1008 "questionSetId must be a UUID"; a different user's token with someone else's real `questionSetId` → WS close 1008 "question set not found or not owned" | **Pass, all sub-scenarios** — see "Question-set-aware prompting" and "Reaching a clean end state" above for details. Required fixing two real bugs first — see "Two real bugs found and fixed by this live-testing pass" above — without which no question-set-backed session could be created at all. |
 | Piper down → fallback error frame, turn not committed | Pass |
 | whisper.cpp down → fallback error frame, turn not committed, no hang | Pass |
 | Kill + restart voice-orchestrator mid-session, reconnect same `sessionId` | Pass — history and `turnCount` survived in Redis, next turn showed continuity |

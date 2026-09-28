@@ -61,18 +61,18 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
     public Mono<Void> handle(WebSocketSession session) {
         String token = extractQueryParam(session, "token");
         if (token == null || !jwtValidator.isValid(token)) {
-            return session.close(CloseStatus.NOT_ACCEPTABLE.withReason("invalid token"));
+            return session.close(CloseStatus.POLICY_VIOLATION.withReason("invalid token"));
         }
 
         String questionSetIdRaw = extractQueryParam(session, "questionSetId");
         if (questionSetIdRaw == null) {
-            return session.close(CloseStatus.NOT_ACCEPTABLE.withReason("questionSetId required"));
+            return session.close(CloseStatus.POLICY_VIOLATION.withReason("questionSetId required"));
         }
         UUID questionSetId;
         try {
             questionSetId = UUID.fromString(questionSetIdRaw);
         } catch (IllegalArgumentException e) {
-            return session.close(CloseStatus.NOT_ACCEPTABLE.withReason("questionSetId must be a UUID"));
+            return session.close(CloseStatus.POLICY_VIOLATION.withReason("questionSetId must be a UUID"));
         }
 
         String ownerEmail = jwtValidator.extractEmail(token);
@@ -90,7 +90,7 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
                 .flatMap(qs -> sessionRepository.loadOrCreate(sessionId, ownerEmail, qs.questions()))
                 .flatMap(state -> runInterview(session, state))
                 .onErrorResume(QuestionSetNotFoundException.class, e ->
-                        session.close(CloseStatus.NOT_ACCEPTABLE.withReason("question set not found or not owned")))
+                        session.close(CloseStatus.POLICY_VIOLATION.withReason("question set not found or not owned")))
                 .onErrorResume(e -> {
                     log.error("Failed to initialize session for question set {}: {}", questionSetId, e.toString());
                     return session.close(CloseStatus.SERVER_ERROR);
