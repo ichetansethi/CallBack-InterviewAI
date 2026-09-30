@@ -48,6 +48,12 @@
             <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
         </dependency>
 
+        <!-- Publishes session-completed events for session-history-service to consume -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+
         <!-- OpenAI-compatible client, pointed at Groq's endpoint for chat/tool-calling -->
         <dependency>
             <groupId>org.springframework.ai</groupId>

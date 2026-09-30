@@ -5,6 +5,14 @@ spring:
     redis:
       host: localhost
       port: 6379
+  kafka:
+    bootstrap-servers: localhost:9092
+    admin:
+      # KafkaAdmin creates the topic during startup and blocks on it (30s default). Kafka being
+      # down must not delay this service coming up for live interviews — the topic is also
+      # declared by session-history-service, and publish failures are already handled per-send.
+      operation-timeout: 5s
+      close-timeout: 2s
   ai:
     openai:
       base-url: https://api.groq.com/openai
@@ -26,3 +34,11 @@ piper:
 services:
   question-service:
     base-url: http://localhost:8084
+
+session-history:
+  kafka:
+    topic: session-completed
+
+turn-decision:
+  # Total time one turn's model calls may take, retries and 429 waits included (see TurnDecisionService).
+  max-turn-duration: 20s

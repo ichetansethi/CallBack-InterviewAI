@@ -415,6 +415,35 @@ The model decides when to end purely from the conversation so far, the same way 
 question-service integration is wanted later, that's a separate, larger feature, not implied by
 this fix.
 
+### Current ending model (2026-09-30): questions end it, follow-ups are capped, exchanges are a safety net
+
+Superseding the exchange-count prompt rules above for sessions with prepared questions. All three
+limits live in `TurnActionPolicy.allowedActions(state)`, a pure function that `TurnDecisionService`
+both renders into the prompt (`ALLOWED ACTIONS THIS TURN: ...`) and enforces: a tool call choosing
+anything else is rejected and the model gets another attempt within the turn budget. Rejecting,
+not rewriting, is deliberate — `responseText` was written for the action the model chose.
+
+| Situation | Allowed |
+|---|---|
+| Opening exchange | `advance` (asks Q1) |
+| Mid-question, < 3 follow-ups | `follow_up`, `advance`, `end` |
+| Mid-question, 3 follow-ups (`MAX_FOLLOW_UPS_PER_QUESTION`) | `advance`, `end` |
+| Last question, < 3 follow-ups | `follow_up`, `end` — never `advance` |
+| Last question, 3 follow-ups | `end` |
+| Exchange ≥ safety cap | `end` |
+
+- `followUpCountForCurrentQuestion` lives in `InterviewSessionState` (Redis) next to
+  `currentQuestionIndex`; `withTurn` resets it whenever the cursor moves (and on the opener).
+- The safety cap is `1 + questions × (3 + 1)` — 29 for 7 questions — the most exchanges the other
+  rules permit, so it lands on the final exchange of a worst-case interview and never cuts short one
+  the other guards would let finish. It only fires if they were bypassed.
+- The model is told to end once the last question has been discussed, or earlier only if the
+  candidate asks to stop. The "never end before exchange 6 / by exchange 8" rules are gone for
+  question-backed sessions; sessions with **no** prepared questions keep judgment-based ending with
+  a fixed cap of 8 (`NO_QUESTIONS_MAX_EXCHANGES`), since they have nothing else to end on.
+- The old "last question → end instead" rule was prompt-only plus the index clamp (an `"advance"`
+  there was accepted and clamped); it is now enforced like the others.
+
 ---
 
 ## TTS streaming (`tts` package)
@@ -496,21 +525,40 @@ question-service itself has no "current question" concept, only a flat ordered l
 list) with an incremented `turnCount`, `currentQuestionIndex` advanced (and clamped) if the turn's
 action was `"advance"`, and bumped `updatedAt` — no in-place mutation of persisted state.
 
-### The known, documented persistence gap
+### Hand-off to session-history-service (`session-completed` Kafka topic)
 
-`SessionHistoryPersister.onConnectionEnded(state)` is invoked from
-`VoiceWebSocketHandler.handle(session)`'s `.doFinally(...)` — firing on normal completion, error,
-or cancellation alike — and today only logs:
+A finished interview is published to Kafka for session-history-service to store and generate
+feedback on. **Only an `"end"` decision publishes** — `closeIfInterviewEnded`, after the closing
+remark has been spoken and the final turn saved, and before the WebSocket is closed. Any other
+disconnect (network drop, client close, error) publishes nothing: the session stays resumable in
+Redis until the TTL, and `doFinally` only logs that the connection ended.
 
-```
-"Connection ended for session {} after {} turn(s); transcript remains in Redis only —
- persistence to session-history-service is not implemented yet."
-```
+`SessionCompletedPublisher.publishCompleted(state, questionSetId)`:
+- maps the state with `SessionCompletedEventMapper` — each `TurnRecord` becomes a `CANDIDATE`
+  turn then a `COACH` turn (`turnIndex` 0..2n-1). The coach turn's `questionRationale` is recovered
+  by replaying `InterviewSessionState.nextQuestionIndex` (the same rule `withTurn` uses) over the
+  history; a closing `"end"` reply carries none. `startedAt`/`endedAt` are the state's
+  `createdAt`/`updatedAt`.
+- gives each completed interview a **fresh random UUID** as its `sessionId`. The Redis identity
+  (`ownerEmail::questionSetId`) recurs every time the same candidate practises the same question
+  set, and session-history-service is idempotent on `sessionId` — a derived id would make it
+  silently drop every later run.
+- sends off the Netty event loop (`boundedElastic` — `KafkaTemplate.send` can block on a metadata
+  fetch), keyed by that UUID, with no `__TypeId__` header and ISO-8601 timestamps (Boot's
+  `ObjectMapper`). Producer timeouts are bounded (`max.block.ms` 5s, `delivery.timeout.ms` 15s) so
+  a broker outage surfaces in seconds, not Kafka's 60s default.
+- **deletes the Redis session only after the broker acks**, so reconnecting starts a fresh
+  interview instead of appending to a finished one. If publishing fails, the handler logs it,
+  closes the connection normally anyway, and the transcript stays in Redis until the TTL.
 
-This is intentional scaffolding, not an oversight: `session-history-service` doesn't exist yet as
-a module. The full transcript isn't lost — it lives in Redis for the 2-hour TTL — but it isn't
-durably persisted past that window. The module's own `CLAUDE.md` says explicitly to delete this
-class once real persistence lands.
+The wire contract (`DTO/SessionCompletedEvent`, `DTO/TranscriptTurnDto`) is a local copy of
+session-history-service's consumer DTOs, not a shared dependency — keep field names in step by hand.
+Both services declare the topic (1 partition, 1 replica) because the broker has auto-create off;
+`spring.kafka.admin.operation-timeout: 5s` stops that declaration from delaying startup by 30s when
+Kafka is down.
+
+**Not published**: abandoned interviews (never reach `"end"`) — they expire from Redis without a
+history record, so session-history-service's `ABANDONED` status is never produced yet.
 
 ---
 
@@ -571,6 +619,8 @@ rather than something to check for after the fact.
 - `spring-ai-starter-model-openai` — pom comment: *"OpenAI-compatible client, pointed at Groq's
   endpoint for chat/tool-calling"* — the same trick compatibility-service and question-service use
   to talk to Groq (which has no dedicated Spring AI starter of its own).
+- `spring-kafka` — `KafkaTemplate` for publishing `session-completed` (see "Hand-off to
+  session-history-service"). Producer only; this service consumes nothing.
 - `reactor-test` (test scope) — backs the `StepVerifier`-based tests for `SentenceBoundaryBuffer`.
 - **No `spring-boot-starter-security` and no `spring-security-config`/`spring-security-webflux`
   starter anywhere on this module's own dependency graph.** Every Spring Security primitive it
@@ -596,6 +646,11 @@ spring:
     redis:
       host: localhost
       port: 6379
+  kafka:
+    bootstrap-servers: localhost:9092
+    admin:
+      operation-timeout: 5s
+      close-timeout: 2s
   ai:
     openai:
       base-url: https://api.groq.com/openai
@@ -613,6 +668,11 @@ piper:
 services:
   question-service:
     base-url: http://localhost:8084
+session-history:
+  kafka:
+    topic: session-completed
+turn-decision:
+  max-turn-duration: 20s
 ```
 
 - `spring.data.redis.host`/`port` — targets the `redis:7-alpine` container added by
@@ -629,6 +689,10 @@ services:
   model abstractions.
 - `services.question-service.base-url` — same `@Value`-into-`WebClient` pattern, injected into
   `QuestionServiceClient`. Port `8084` matches question-service's own `application.yml`.
+- `spring.kafka.bootstrap-servers` — docker-compose's `callback-kafka` host listener.
+  `spring.kafka.admin.*` bounds startup-time topic creation (see "Hand-off to
+  session-history-service"). `session-history.kafka.topic` is the topic name, shared by the
+  `NewTopic` bean and `SessionCompletedPublisher`.
 - No `spring.data.redis.password`, no Redis SSL/timeout tuning, no actuator/management
   configuration — deliberately minimal, dev-focused config.
 
@@ -636,9 +700,10 @@ services:
 
 ## Testing — what's verified, and the real gap
 
-Only pure-logic, dependency-free classes are unit tested. Nothing integration-level exists: no
-`@SpringBootTest`, no embedded/Testcontainers Redis, no WireMock stand-in for Whisper/Piper/Groq,
-and no reactive WebSocket integration test of `VoiceWebSocketHandler` itself.
+Mostly pure-logic, dependency-free classes are unit tested. The one integration-level exception is
+the Kafka hand-off (`SessionCompletedPublisher*Test`), which runs `@SpringBootTest` against the real
+local broker and Redis — so those two must be running. There is still no WireMock stand-in for
+Whisper/Piper/Groq and no reactive WebSocket integration test of `VoiceWebSocketHandler` itself.
 
 | Test class | Coverage |
 |---|---|
@@ -648,6 +713,15 @@ and no reactive WebSocket integration test of `VoiceWebSocketHandler` itself.
 | `SentenceBoundaryBufferTest` | Streaming deltas emit a sentence exactly on terminal punctuation; a never-terminated trailing fragment flushes on source completion; empty source produces nothing |
 | `SentenceSplitterTest` | Splits on terminal punctuation; punctuation-less input stays one "sentence"; blank input → empty list |
 | `InterviewSessionStateTest` | `"advance"` moves `currentQuestionIndex` forward; `"follow_up"` leaves it unchanged; repeated `"advance"` past the last question clamps rather than going out of bounds; an empty question list leaves the index at 0 |
+| `SessionCompletedEventMapperTest` | Each exchange flattens to CANDIDATE then COACH with sequential `turnIndex`; coach rationale follows the replayed question cursor through follow_up/advance/clamp; `"end"` reply and question-less sessions carry no rationale; empty history → empty transcript |
+| `SessionCompletedPublisherTest` | Real broker + Redis, own topic per run: record read back raw — key = event `sessionId`, no `__TypeId__` header, ISO-8601 timestamps, exact transcript field names/values; Redis session deleted after publish; the same Redis session published twice gets two different ids |
+| `SessionCompletedPublisherBrokerDownTest` | Broker unreachable → publish fails in ~5s (bounded `max.block.ms`) and the transcript stays in Redis |
+| `TurnDecisionPromptTest` | Opening prompt says nothing has been asked and offers only Q1; later prompts show the already-asked question and the next one; LAST flag appears only once the last question has been asked |
+| `TurnDecisionServiceTest` | **Real Groq**: opener asks Q1 and leaves the cursor on it; a complete answer advances to Q2 instead of re-asking Q1; answering the last question ends the interview; at the follow-up cap a vague answer advances (count resets) instead of probing again; the last question at its cap ends |
+| `ChatModelErrorHandlingConfigTest` | Copied from question-service: 429 Retry-After survives into `GroqRateLimitException`; other statuses keep Spring AI's default classification |
+| `TurnActionPolicyTest` | Every row of the allowed-actions table; cap resets on the next question; safety cap equals the worst-case final exchange and still stops a guard-bypassing history; no-questions sessions keep the fixed cap of 8 |
+| `TurnDecisionGuardTest` | Stub Groq scripted to break the rules: a 4th follow-up and an `advance` on the last question are rejected and the compliant retry accepted; a never-complying model can't get a disallowed action through; action normalised to lower case |
+| `TurnDecisionRateLimitTest` | Stub Groq through the real Spring AI client: short Retry-After waited out then succeeds; Retry-After beyond the budget fails in <1s; repeated 429s without Retry-After give up inside the budget |
 
 No automated test exists for `TurnDecisionService`/`TurnDecisionRecorder` (would require mocking
 `ChatClient`), `InterviewSessionRepository` (would need embedded Redis or a fake
@@ -671,6 +745,9 @@ once, against a real local stack, not by a repeatable test suite.
 | Short single-word utterance ("Yes") | Pass — VAD flushes correctly, one turn |
 | Mid-sentence thinking pause (~1.2s) | **Failed before the `SILENCE_HOLD_MS` fix** — utterance split into two turns. Fixed and re-verified: 1200ms pause (under the new 1500ms threshold) → 1 turn, no split; 1800ms pause (over threshold) → 2 turns, split still occurs as intended |
 | Real end-to-end turn latency (candidate stops talking → audio starts) | Pre-fix (`SILENCE_HOLD_MS=700`): median ~1.9s, range 1.8-2.4s (9 samples). Post-fix (`SILENCE_HOLD_MS=1500`): median ~3.1s, range 2.5-4.5s (6 samples) — confirms the ~800ms-plus latency cost of the pause fix is real |
+| **Hand-off to session-history-service (2026-09-30)**: scripted spoken interview via `scripts/voice_ws_test_client.py` against real whisper.cpp/Piper/Groq/question-service/Kafka and a running session-history-service | **Pass.** First connection dropped after 5 turns on a Groq 429 (tokens-per-minute) — correctly published nothing and left the session resumable; reconnect resumed it, model chose `"end"`, 14 turns (all 7 exchanges, both connections) published, Redis key deleted, session-history-service stored it and served grounded per-question feedback via `GET /sessions/{id}`. Surfaced the question-cursor off-by-one below (item 9). |
+| **Cursor fix re-run (2026-09-30)** | **Pass for the fix**: one connection, 8 exchanges, clean 1000 close, 16 turns published, Redis cleared, feedback stored. Opener asked Q1 with Q1's rationale; every coach turn's rationale matched the question actually being discussed. Only Q1–Q3 were reached — four follow-ups on Q2 (scripted answers couldn't adapt to them) used up the 8-exchange cap (item 10). No 429 occurred, so the turn budget was only exercised by `TurnDecisionRateLimitTest`. |
+| **Follow-up cap live run (2026-09-30)**: 3-question fixture set, vague answers on Q1 | **Pass**: all 3 questions covered in 9 exchanges on one connection (clean 1000 close); follow-up count reset on every advance; Q3 (last) took 3 follow-ups, leaving `end` the only allowed action, and the model ended; rationales matched on every coach turn; 18 turns published, Redis cleared, feedback stored. No guard rejection was needed — the model stayed within the listed actions. The mid-question cap wasn't hit live (the model advanced on its own after one follow-up) — covered by `TurnDecisionServiceTest`/`TurnDecisionGuardTest`. |
 | Clean interview end state | Was entirely missing (no `"end"` action existed); added and verified live across 3 sessions — model chose `"end"` on an explicit candidate cue each time, WebSocket closed with code 1000 (normal closure) each time. The later turn-count-in-prompt change (see "Reaching a clean end state") has **not yet** been re-verified live |
 
 This table is a point-in-time record of one manual pass, not a substitute for the automated tests
@@ -694,8 +771,8 @@ this section still lacks — update or re-verify it the next time this pipeline 
 4. **Streaming TTS/turn-decision infrastructure exists but is dormant** — `SentenceBoundaryBuffer`
    and `speakStream()` are ready for when `TurnDecisionService` produces token-by-token output;
    the current code path is the non-streaming `speak()`/`SentenceSplitter` combination.
-5. **`SessionHistoryPersister` is a placeholder** slated for deletion once `session-history-service`
-   exists — don't build durability logic into it; build the real service instead.
+5. **Only `"end"` hands a session to session-history-service** — see "Hand-off to
+   session-history-service". The old `SessionHistoryPersister` placeholder is gone.
 6. **The interview end condition now has two independent paths, one prompt-driven and one
    code-enforced.** The model can choose `"end"` on its own judgment, guided by an explicit
    exchange number in the prompt (`MIN_EXCHANGES_BEFORE_END = 6`, `TARGET_MAX_EXCHANGES = 8` in
@@ -716,6 +793,25 @@ this section still lacks — update or re-verify it the next time this pipeline 
 8. **`SILENCE_HOLD_MS` (1500ms) is a deliberately imperfect trade-off**, not a solved problem — see
    "Audio processing details" above. Don't casually lower it back toward 700ms without re-running
    the mid-thought-pause test that caught the original bug.
+9. **`currentQuestionIndex` means "the prepared question most recently asked".** The opening
+   exchange always lands on question 1 (`InterviewSessionState.nextQuestionIndex`), and the opening
+   prompt says nothing has been asked yet. Before this (found live 2026-09-30, fixed the same day)
+   the model opened with an `"advance"` that asked question 1 but moved the cursor to 2, so the
+   cursor ran one ahead for the whole interview: the last prepared question was never asked and
+   published rationales were shifted by one. Later prompts label the question "currently being
+   discussed — already asked" so the model advances past it rather than re-asking it.
+10. **Follow-ups are capped per question, not per interview** — see "Current ending model". The
+    earlier 8-exchange cap let one heavily probed question crowd out the rest (seen live
+    2026-09-30); that cap is now only a safety net, sized from the question count.
+11. **Turn-decision time budget** (`turn-decision.max-turn-duration`, 20s): all attempts for one
+    turn, 429 waits included, share it. A 429 waits out Groq's Retry-After (kept by
+    `ChatModelErrorHandlingConfig`, copied from question-service) or 2s/4s/8s, only if the wait fits;
+    otherwise the turn fails fast into the "could you repeat that?" fallback with the connection
+    still open. Before this, a turn stalled ~40s on 429s and the connection dropped.
+12. **Tool parameter names depend on the parent pom's `-parameters` flag** (added 2026-09-30).
+    Without it Spring AI sends `submitTurnDecision`'s parameters to the model as `arg0`/`arg1`
+    instead of `action`/`responseText`; `TurnDecisionRateLimitTest` asserts the real names so a
+    lost flag fails the build.
 
 ---
 

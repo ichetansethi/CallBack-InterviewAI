@@ -41,6 +41,10 @@ public class InterviewSessionRepository {
                 .thenReturn(state);
     }
 
+    public Mono<Void> delete(String sessionId) {
+        return redisTemplate.delete(key(sessionId)).then();
+    }
+
     private String key(String sessionId) {
         return KEY_PREFIX + sessionId;
     }

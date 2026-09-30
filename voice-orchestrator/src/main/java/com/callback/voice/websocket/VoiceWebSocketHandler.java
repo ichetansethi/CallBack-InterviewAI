@@ -9,7 +9,7 @@ import com.callback.voice.client.QuestionSetNotFoundException;
 import com.callback.voice.client.WhisperClient;
 import com.callback.voice.session.InterviewSessionRepository;
 import com.callback.voice.session.InterviewSessionState;
-import com.callback.voice.session.SessionHistoryPersister;
+import com.callback.voice.session.SessionCompletedPublisher;
 import com.callback.voice.session.TurnRecord;
 import com.callback.voice.tts.TextToSpeechStreamer;
 import com.callback.voice.turn.TurnDecisionService;
@@ -37,7 +37,7 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
     private final WhisperClient whisperClient;
     private final TurnDecisionService turnDecisionService;
     private final TextToSpeechStreamer textToSpeechStreamer;
-    private final SessionHistoryPersister sessionHistoryPersister;
+    private final SessionCompletedPublisher sessionCompletedPublisher;
     private final QuestionServiceClient questionServiceClient;
 
     public VoiceWebSocketHandler(JwtValidator jwtValidator,
@@ -46,14 +46,14 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
                                  WhisperClient whisperClient,
                                  TurnDecisionService turnDecisionService,
                                  TextToSpeechStreamer textToSpeechStreamer,
-                                 SessionHistoryPersister sessionHistoryPersister, QuestionServiceClient questionServiceClient) {
+                                 SessionCompletedPublisher sessionCompletedPublisher, QuestionServiceClient questionServiceClient) {
         this.jwtValidator = jwtValidator;
         this.sessionRepository = sessionRepository;
         this.voiceActivityDetector = voiceActivityDetector;
         this.whisperClient = whisperClient;
         this.turnDecisionService = turnDecisionService;
         this.textToSpeechStreamer = textToSpeechStreamer;
-        this.sessionHistoryPersister = sessionHistoryPersister;
+        this.sessionCompletedPublisher = sessionCompletedPublisher;
         this.questionServiceClient = questionServiceClient;
     }
 
@@ -88,7 +88,7 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
 
         return questionServiceClient.getQuestionSet(questionSetId, bearerToken)
                 .flatMap(qs -> sessionRepository.loadOrCreate(sessionId, ownerEmail, qs.questions()))
-                .flatMap(state -> runInterview(session, state))
+                .flatMap(state -> runInterview(session, state, questionSetId))
                 .onErrorResume(QuestionSetNotFoundException.class, e ->
                         session.close(CloseStatus.POLICY_VIOLATION.withReason("question set not found or not owned")))
                 .onErrorResume(e -> {
@@ -97,17 +97,19 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
                 });
     }
 
-    private Mono<Void> runInterview(WebSocketSession session, InterviewSessionState state) {
+    private Mono<Void> runInterview(WebSocketSession session, InterviewSessionState state, UUID questionSetId) {
         AtomicReference<InterviewSessionState> stateRef = new AtomicReference<>(state);
         UtteranceBuffer utteranceBuffer = new UtteranceBuffer(voiceActivityDetector);
 
         return sendSessionAck(session, state.sessionId())
                 .then(session.receive()
-                        .concatMap(message -> handleIncomingAudioChunk(session, message, stateRef, utteranceBuffer))
+                        .concatMap(message -> handleIncomingAudioChunk(session, message, stateRef, utteranceBuffer, questionSetId))
                         .then())
-                // Fires on normal completion, error, or cancellation alike — the one place that
-                // reliably sees "this connection is over," regardless of why.
-                .doFinally(signalType -> sessionHistoryPersister.onConnectionEnded(stateRef.get()));
+                // Fires on normal completion, error, or cancellation alike. Only an "end" decision
+                // hands the session to session-history-service (see closeIfInterviewEnded); any other
+                // disconnect leaves it resumable in Redis until the TTL.
+                .doFinally(signalType -> log.info("Connection ended ({}) for session {} after {} turn(s)",
+                        signalType, stateRef.get().sessionId(), stateRef.get().turnCount()));
     }
 
     private Mono<Void> sendSessionAck(WebSocketSession session, String sessionId) {
@@ -123,7 +125,7 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
 
     private Mono<Void> handleIncomingAudioChunk(WebSocketSession session, WebSocketMessage message,
                                                  AtomicReference<InterviewSessionState> stateRef,
-                                                 UtteranceBuffer utteranceBuffer) {
+                                                 UtteranceBuffer utteranceBuffer, UUID questionSetId) {
         if (message.getType() != WebSocketMessage.Type.BINARY) {
             // Only binary frames carry audio; anything else (e.g. a future text control message) is ignored for now.
             return Mono.empty();
@@ -136,7 +138,7 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
 
         byte[] utteranceWav = utteranceBuffer.flushAsWav();
         return whisperClient.transcribe(utteranceWav)
-                .flatMap(transcript -> processTurn(session, transcript, stateRef))
+                .flatMap(transcript -> processTurn(session, transcript, stateRef, questionSetId))
                 // One failed utterance (Whisper/Groq/Piper down, a bad transcription) shouldn't
                 // tear down the whole interview connection — log it, tell the candidate, and wait
                 // for the next one. Turn state was never committed for this attempt (see
@@ -157,7 +159,8 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
                 "{\"type\":\"error\",\"message\":\"Sorry, something went wrong — could you repeat that?\"}")));
     }
 
-    private Mono<Void> processTurn(WebSocketSession session, String transcript, AtomicReference<InterviewSessionState> stateRef) {
+    private Mono<Void> processTurn(WebSocketSession session, String transcript,
+                                   AtomicReference<InterviewSessionState> stateRef, UUID questionSetId) {
         InterviewSessionState current = stateRef.get();
 
         // Commit only after the response has actually been synthesized and sent — not before
@@ -170,7 +173,7 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
         return turnDecisionService.decideNextTurn(transcript, current)
                 .flatMap(decision -> textToSpeechStreamer.speak(session, decision.responseText())
                         .then(saveTurn(current, transcript, decision, stateRef))
-                        .then(closeIfInterviewEnded(session, decision)))
+                        .then(closeIfInterviewEnded(session, decision, stateRef, questionSetId)))
                 .then();
     }
 
@@ -183,14 +186,30 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
     // The model closes out the interview itself via the "end" action (see TurnDecisionRecorder).
     // Closing here — after its closing remark has already been spoken and the turn saved — is what
     // makes the session reach a clean end state instead of the connection just sitting open
-    // indefinitely once the interview is logically over.
-    private Mono<Void> closeIfInterviewEnded(WebSocketSession session, TurnDecision decision) {
+    // indefinitely once the interview is logically over. It's also the one point where the
+    // interview is known to be complete, so it's where the transcript is handed off.
+    private Mono<Void> closeIfInterviewEnded(WebSocketSession session, TurnDecision decision,
+                                             AtomicReference<InterviewSessionState> stateRef, UUID questionSetId) {
         if (!"end".equalsIgnoreCase(decision.action())) {
             return Mono.empty();
         }
-        log.info("Interview ended by model decision on session {}; closing connection.",
-                session.getHandshakeInfo().getUri());
-        return session.close(CloseStatus.NORMAL);
+        // Deferred: this Mono is assembled before saveTurn runs, and must read stateRef only after
+        // it has been updated with the final (closing) turn.
+        return Mono.defer(() -> {
+                    InterviewSessionState finished = stateRef.get();
+                    log.info("Interview ended by model decision on session {}; publishing and closing connection.",
+                            finished.sessionId());
+                    return sessionCompletedPublisher.publishCompleted(finished, questionSetId)
+                            .then()
+                            // A failed hand-off must not keep the candidate's connection open: the
+                            // transcript stays in Redis (see SessionCompletedPublisher) and is logged here.
+                            .onErrorResume(e -> {
+                                log.error("Failed to publish session-completed for session {}; transcript left in Redis: {}",
+                                        finished.sessionId(), e.toString());
+                                return Mono.empty();
+                            });
+                })
+                .then(session.close(CloseStatus.NORMAL));
     }
 
 }
