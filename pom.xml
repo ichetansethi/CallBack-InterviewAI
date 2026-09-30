@@ -45,5 +45,24 @@
     <module>compatibility-service</module>
     <module>question-service</module>
     <module>voice-orchestrator</module>
-  </modules>
+        <module>session-history-service</module>
+    </modules>
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.15.0</version>
+                    <configuration>
+                        <!-- Keep Java parameter names in the bytecode (spring-boot-starter-parent does
+                             this; this repo imports the Boot BOM instead, so it has to be explicit).
+                             Without it Spring AI sends @Tool parameters to the model as arg0/arg1, and
+                             Spring MVC can't bind an unnamed @PathVariable/@RequestParam. -->
+                        <parameters>true</parameters>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
 </project>
