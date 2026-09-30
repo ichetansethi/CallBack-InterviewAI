@@ -1,5 +1,6 @@
 package com.callback.question.service;
 
+import com.callback.question.DTO.GeneratedQuestion;
 import com.callback.question.DTO.InterviewQuestionResponse;
 import com.callback.question.DTO.QuestionBatch;
 import com.callback.question.DTO.QuestionGenerateRequest;
@@ -16,6 +17,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.stream.IntStream;
 
 /**
  * Orchestrates the full question-generation flow: fetch the JD text (forwarding the caller's
@@ -58,8 +60,10 @@ public class QuestionSetService {
         QuestionSet qs = new QuestionSet(ownerEmail, request.jdId(), request.compatibilityAnalysisId());
         QuestionSet saved = questionSetRepository.save(qs);
 
-        List<InterviewQuestion> questions = generated.questions().stream()
-                .map(gq -> new InterviewQuestion(saved, gq.category(), gq.questionText(), gq.rationale()))
+        List<GeneratedQuestion> batch = generated.questions();
+        List<InterviewQuestion> questions = IntStream.range(0, batch.size())
+                .mapToObj(i -> new InterviewQuestion(saved, batch.get(i).category(), batch.get(i).questionText(),
+                        batch.get(i).rationale(), i))
                 .toList();
         interviewQuestionRepository.saveAll(questions);
 

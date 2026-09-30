@@ -5,6 +5,7 @@ import com.callback.question.DTO.QuestionGenerateRequest;
 import com.callback.question.DTO.QuestionSetResponse;
 import com.callback.question.client.CompatibilityClient;
 import com.callback.question.client.JdResumeClient;
+import com.callback.question.model.InterviewQuestion;
 import com.callback.question.repository.InterviewQuestionRepository;
 import com.callback.question.repository.QuestionSetRepository;
 import org.junit.jupiter.api.Test;
@@ -78,6 +79,10 @@ class QuestionSetServiceTest {
         assertThat(interviewQuestionRepository.findAll())
                 .filteredOn(iq -> iq.getQuestionSet().getId().equals(response.id()))
                 .hasSameSizeAs(response.questions());
+        // Each question stored at its position in the generated batch (see QuestionSetOrderingTest).
+        assertThat(interviewQuestionRepository.findByQuestionSetIdOrderByOrderIndexAsc(response.id()))
+                .extracting(InterviewQuestion::getOrderIndex)
+                .containsExactlyElementsOf(java.util.stream.IntStream.range(0, response.questions().size()).boxed().toList());
 
         org.mockito.Mockito.verifyNoInteractions(compatibilityClient);
     }

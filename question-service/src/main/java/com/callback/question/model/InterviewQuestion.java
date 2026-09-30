@@ -12,16 +12,18 @@ public class InterviewQuestion {
     private String category;      // "technical" | "behavioral" | "role-specific"
     @Column(columnDefinition = "TEXT") private String questionText;
     @Column(columnDefinition = "TEXT") private String rationale; // why this question, grounded in JD/gap
-    private int orderIndex;
+    private int orderIndex; // position within the set, 0-based — voice-orchestrator asks questions in this order
 
     protected InterviewQuestion() {
     }
 
-    public InterviewQuestion(QuestionSet questionSet, String category, String questionText, String rationale) {
+    /** orderIndex is the question's position in its set — reads sort by it, so it must be set. */
+    public InterviewQuestion(QuestionSet questionSet, String category, String questionText, String rationale, int orderIndex) {
         this.questionSet = questionSet;
         this.category = category;
         this.questionText = questionText;
         this.rationale = rationale;
+        this.orderIndex = orderIndex;
     }
 
     public UUID getId() {
