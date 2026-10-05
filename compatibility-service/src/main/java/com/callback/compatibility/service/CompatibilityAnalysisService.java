@@ -17,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.UUID;
@@ -84,6 +85,10 @@ public class CompatibilityAnalysisService {
         return toResponse(saved);
     }
 
+    // Keeps the session open while toResponse reads the lazy suggestions collection; with
+    // open-in-view off, findById's session is otherwise already closed by then. analyze() needs
+    // no equivalent: the entity it maps is the one it just built, suggestions already in memory.
+    @Transactional(readOnly = true)
     public AnalyzeResponse getById(UUID id, String callerEmail) {
         return toResponse(findOwned(id, callerEmail));
     }
