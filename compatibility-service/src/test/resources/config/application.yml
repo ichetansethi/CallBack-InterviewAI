@@ -1,0 +1,10 @@
+# Loaded on top of src/main/resources/application.yml: Spring Boot reads classpath:/config/ after
+# classpath:/, and later locations win. Only the test classpath has this file.
+#
+# Tests share the dev broker. A listener started in every test context would join the real
+# compatibility-service consumer group and take events meant for a running service, then run the
+# LLM pipeline on them. AnalysisRequestedListenerTest switches it back on with its own group.
+compatibility:
+  kafka:
+    listener:
+      auto-startup: false

@@ -6,9 +6,11 @@ import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.IntStream;
 
 /**
  * Chunks a resume's text and indexes it into the shared, persistent pgvector store, keyed by
@@ -40,9 +42,31 @@ public class RagRetrievalService {
         if (isIndexed(resumeId)) {
             return;
         }
+        index(resumeId, resumeText);
+    }
+
+    /**
+     * Writes every chunk unconditionally. Chunk ids are derived from resumeId + position instead of
+     * the splitter's random UUIDs, and PgVectorStore inserts with ON CONFLICT (id) DO UPDATE, so
+     * indexing the same resume again overwrites its chunks rather than duplicating them. That
+     * matters when isIndexed's check is bypassed: two analyses of one resume racing past it, or an
+     * analysis re-run after a crash.
+     */
+    void index(UUID resumeId, String resumeText) {
         Document source = new Document(resumeText, Map.of(RESUME_ID_KEY, resumeId.toString()));
         List<Document> chunks = splitter.split(source);
-        vectorStore.add(chunks);
+        List<Document> withStableIds = IntStream.range(0, chunks.size())
+                .mapToObj(i -> Document.builder()
+                        .id(chunkId(resumeId, i))
+                        .text(chunks.get(i).getText())
+                        .metadata(chunks.get(i).getMetadata())
+                        .build())
+                .toList();
+        vectorStore.add(withStableIds);
+    }
+
+    private static String chunkId(UUID resumeId, int position) {
+        return UUID.nameUUIDFromBytes((resumeId + ":" + position).getBytes(StandardCharsets.UTF_8)).toString();
     }
 
     public boolean isIndexed(UUID resumeId) {

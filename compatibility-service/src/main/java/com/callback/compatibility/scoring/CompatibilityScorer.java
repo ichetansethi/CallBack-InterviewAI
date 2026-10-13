@@ -63,21 +63,10 @@ public class CompatibilityScorer {
     });
 
     private final ChatClient chatClient;
+    private final RateLimitBackoff backoff = new RateLimitBackoff();
 
     public CompatibilityScorer(ChatClient.Builder chatClientBuilder) {
         this.chatClient = chatClientBuilder.build();
-    }
-
-    /** Backs off before a retry — longer if the failure looks like a rate limit, so the retry loop
-     * doesn't just immediately re-hit the same limit within the same window. */
-    private void backoffBeforeRetry(RuntimeException failure) {
-        String message = String.valueOf(failure.getMessage());
-        long millis = (message.contains("429") || message.toLowerCase().contains("rate_limit")) ? 12000 : 300;
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
     }
 
     private <T> T callWithTimeout(Supplier<T> modelCall) {
@@ -186,7 +175,7 @@ public class CompatibilityScorer {
                 lastFailure = e;
                 log.warn("Judgment attempt {}/{} for requirement \"{}\" failed: {}",
                         attempt, MAX_ATTEMPTS, re.requirement(), e.toString());
-                backoffBeforeRetry(e);
+                backoff.waitBeforeRetry(e);
             }
         }
         log.warn("Judgment vote failed for requirement \"{}\" after {} attempts: {}",
@@ -222,7 +211,7 @@ public class CompatibilityScorer {
             } catch (RuntimeException e) {
                 lastFailure = e;
                 log.warn("Scoring attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, e.toString());
-                backoffBeforeRetry(e);
+                backoff.waitBeforeRetry(e);
             }
         }
         throw new IllegalStateException("Model failed to produce valid scores after "

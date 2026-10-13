@@ -152,4 +152,33 @@ class RagRetrievalTest {
 
         assertThat(countAfterSecondCall).isEqualTo(countAfterFirstIndex);
     }
+
+    /**
+     * Bypasses isIndexed's skip to model what it can't prevent: two analyses of one resume racing
+     * past the check, or a re-run after a crash mid-insert. Stable chunk ids make the second write
+     * overwrite the first instead of adding a second copy of every chunk.
+     */
+    @Test
+    void indexingTheSameResumeTwiceOverwritesInsteadOfDuplicating() throws IOException {
+        UUID id = UUID.randomUUID();
+        resumeId = id;
+        String resumeText = new String(
+                new ClassPathResource("fixtures/sample-resume.txt").getInputStream().readAllBytes(),
+                StandardCharsets.UTF_8);
+
+        ragRetrievalService.index(id, resumeText);
+        List<String> idsAfterFirst = chunkIds(id);
+
+        ragRetrievalService.index(id, resumeText);
+        List<String> idsAfterSecond = chunkIds(id);
+
+        assertThat(idsAfterFirst).hasSizeGreaterThan(1);
+        assertThat(idsAfterSecond).isEqualTo(idsAfterFirst);
+    }
+
+    private List<String> chunkIds(UUID id) {
+        return jdbcTemplate.queryForList(
+                "SELECT id::text FROM vector_store WHERE metadata->>'resumeId' = ? ORDER BY id",
+                String.class, id.toString());
+    }
 }

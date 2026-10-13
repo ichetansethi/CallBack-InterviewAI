@@ -1,20 +1,15 @@
 package com.callback.compatibility.service;
 
-import com.callback.compatibility.DTO.AnalyzeResponse;
-import com.callback.compatibility.client.JdResumeServiceClient;
+import com.callback.compatibility.scoring.ScoreBreakdown;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.when;
 
 /**
  * Regression test for a real bug found while smoke-testing the actual /compatibility/analyze
@@ -22,18 +17,14 @@ import static org.mockito.Mockito.when;
  * *something*, even for a requirement the resume never covers, so "empty evidence" alone never
  * signals a gap. CompatibilityAnalysisService now filters retrieved chunks by a similarity floor
  * before treating them as evidence — this test proves a genuine gap in a small resume still
- * surfaces as a suggestion once that fix is in place. jd-resume-service itself is mocked out
- * (network-isolated) since this test is about the RAG/scoring pipeline, not the HTTP boundary
- * already covered by JdResumeServiceClientTest.
+ * surfaces as a suggestion once that fix is in place. Calls the pipeline directly with texts, so
+ * jd-resume-service isn't involved; that HTTP boundary is covered by JdResumeServiceClientTest.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
-class CompatibilityAnalysisServiceTest {
-
-    @MockitoBean
-    private JdResumeServiceClient jdResumeServiceClient;
+class AnalysisPipelineTest {
 
     @Autowired
-    private CompatibilityAnalysisService service;
+    private AnalysisPipeline pipeline;
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -49,7 +40,6 @@ class CompatibilityAnalysisServiceTest {
 
     @Test
     void aGenuineGapInAShortResumeStillProducesAGroundedSuggestion() {
-        UUID jdId = UUID.randomUUID();
         resumeId = UUID.randomUUID();
 
         // Deliberately short — like the real short PDF resume that exposed this bug — so it
@@ -66,10 +56,7 @@ class CompatibilityAnalysisServiceTest {
                 Requirements: 5+ years Java and Spring Boot; Terraform and Ansible infrastructure-as-code;
                 GraphQL API design; on-call incident response experience.""";
 
-        when(jdResumeServiceClient.fetchJobDescriptionText(eq(jdId), any())).thenReturn(jdText);
-        when(jdResumeServiceClient.fetchResumeText(eq(resumeId), any())).thenReturn(resumeText);
-
-        AnalyzeResponse response = service.analyze(jdId, resumeId, "owner@example.com", "Bearer test-token");
+        ScoreBreakdown response = pipeline.run(jdText, resumeText, resumeId);
 
         System.out.println("Response: " + response);
         assertThat(response.suggestions()).isNotEmpty();

@@ -9,6 +9,8 @@ spring:
     hibernate:
       ddl-auto: update
     open-in-view: false
+  kafka:
+    bootstrap-servers: localhost:9092
   ai:
     model:
       chat: openai
@@ -38,3 +40,10 @@ server:
 
 jd-resume-service:
   base-url: http://localhost:8082
+
+compatibility:
+  kafka:
+    topic: analysis-requested
+    group-id: compatibility-service
+    listener:
+      auto-startup: true

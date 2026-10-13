@@ -1,93 +1,85 @@
 package com.callback.compatibility.service;
 
+import com.callback.compatibility.DTO.AnalysisAcceptedResponse;
+import com.callback.compatibility.DTO.AnalysisRequestedEvent;
 import com.callback.compatibility.DTO.AnalyzeResponse;
 import com.callback.compatibility.DTO.SuggestionResponse;
 import com.callback.compatibility.client.JdResumeServiceClient;
+import com.callback.compatibility.exception.AnalysisQueueUnavailableException;
 import com.callback.compatibility.exception.CompatibilityAnalysisNotFoundException;
-import com.callback.compatibility.model.AnalysisSuggestion;
+import com.callback.compatibility.model.AnalysisStatus;
 import com.callback.compatibility.model.CompatibilityAnalysis;
-import com.callback.compatibility.rag.RagRetrievalService;
 import com.callback.compatibility.repository.CompatibilityAnalysisRepository;
-import com.callback.compatibility.scoring.CompatibilityScorer;
-import com.callback.compatibility.scoring.RequirementEvidence;
-import com.callback.compatibility.scoring.RequirementExtractor;
-import com.callback.compatibility.scoring.ScoreBreakdown;
-import com.callback.compatibility.scoring.TweakSuggestion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.document.Document;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /**
- * Orchestrates a single analyze request: fetch JD + resume text from jd-resume-service (relaying
- * the caller's token, so jd-resume-service's own ownership checks are what actually gate access —
- * this service never re-implements that check), index the resume if needed, extract requirements,
- * retrieve per-requirement evidence, score via function calling, persist, respond.
+ * Request side of an analysis: fetch JD + resume text from jd-resume-service (relaying the
+ * caller's token, so jd-resume-service's own ownership checks are what actually gate access —
+ * this service never re-implements that check), save a PENDING row and queue it on Kafka. The
+ * analysis itself runs later, off the request thread. Also serves reads of the result.
  */
 @Service
 public class CompatibilityAnalysisService {
 
     private static final Logger log = LoggerFactory.getLogger(CompatibilityAnalysisService.class);
-    private static final int EVIDENCE_TOP_K = 3;
+    private static final int PUBLISH_TIMEOUT_SECONDS = 5;
 
     private final JdResumeServiceClient jdResumeServiceClient;
-    private final RagRetrievalService ragRetrievalService;
-    private final RequirementExtractor requirementExtractor;
-    private final CompatibilityScorer compatibilityScorer;
     private final CompatibilityAnalysisRepository repository;
+    private final KafkaTemplate<String, AnalysisRequestedEvent> kafkaTemplate;
+    private final String topic;
 
     public CompatibilityAnalysisService(JdResumeServiceClient jdResumeServiceClient,
-                                         RagRetrievalService ragRetrievalService,
-                                         RequirementExtractor requirementExtractor,
-                                         CompatibilityScorer compatibilityScorer,
-                                         CompatibilityAnalysisRepository repository) {
+                                         CompatibilityAnalysisRepository repository,
+                                         KafkaTemplate<String, AnalysisRequestedEvent> kafkaTemplate,
+                                         @Value("${compatibility.kafka.topic}") String topic) {
         this.jdResumeServiceClient = jdResumeServiceClient;
-        this.ragRetrievalService = ragRetrievalService;
-        this.requirementExtractor = requirementExtractor;
-        this.compatibilityScorer = compatibilityScorer;
         this.repository = repository;
+        this.kafkaTemplate = kafkaTemplate;
+        this.topic = topic;
     }
 
-    public AnalyzeResponse analyze(UUID jdId, UUID resumeId, String ownerEmail, String authorizationHeader) {
+    /**
+     * Fetches both texts here, while the caller's token can still be relayed: a jdId or resumeId the
+     * caller doesn't own is a 404 now, with no row saved and nothing queued. The event carries the
+     * texts because the consumer has no token to fetch them with.
+     *
+     * Saving the row and then publishing is a dual write. If the publish fails, the row is marked
+     * FAILED rather than left PENDING forever. (The production answer is a transactional outbox.)
+     */
+    public AnalysisAcceptedResponse requestAnalysis(UUID jdId, UUID resumeId, String ownerEmail, String authorizationHeader) {
         String jdText = jdResumeServiceClient.fetchJobDescriptionText(jdId, authorizationHeader);
         String resumeText = jdResumeServiceClient.fetchResumeText(resumeId, authorizationHeader);
 
-        ragRetrievalService.indexResumeIfAbsent(resumeId, resumeText);
-
-        List<String> requirements = requirementExtractor.extract(jdText);
-        List<RequirementEvidence> evidence = requirements.stream()
-                .map(requirement -> {
-                    List<Document> retrieved = ragRetrievalService.retrieveEvidence(resumeId, requirement, EVIDENCE_TOP_K);
-                    log.info("Evidence scores for requirement \"{}\": {}", requirement,
-                            retrieved.stream().map(Document::getScore).toList());
-                    // Deliberately NOT filtered by similarity score — see CompatibilityScorer's
-                    // class-level note: score alone doesn't reliably separate covered from not
-                    // covered, so the scorer reads this raw text itself and judges from that.
-                    return new RequirementEvidence(requirement, retrieved.stream().map(Document::getText).toList());
-                })
-                .toList();
-
-        ScoreBreakdown scoreBreakdown = compatibilityScorer.score(jdText, evidence);
-
-        CompatibilityAnalysis analysis = new CompatibilityAnalysis(
-                ownerEmail, jdId, resumeId,
-                scoreBreakdown.skillsOverlap(), scoreBreakdown.experienceMatch(),
-                scoreBreakdown.keywordCoverage(), scoreBreakdown.semanticSimilarity());
-        for (TweakSuggestion suggestion : scoreBreakdown.suggestions()) {
-            analysis.addSuggestion(new AnalysisSuggestion(suggestion.jdRequirement(), suggestion.suggestion()));
+        CompatibilityAnalysis analysis = repository.save(CompatibilityAnalysis.pending(ownerEmail, jdId, resumeId));
+        AnalysisRequestedEvent event = new AnalysisRequestedEvent(
+                analysis.getId(), ownerEmail, jdId, resumeId, jdText, resumeText, Instant.now());
+        try {
+            kafkaTemplate.send(topic, ownerEmail, event).get(PUBLISH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            log.error("Could not publish analysis {}; marking it FAILED", analysis.getId(), e);
+            analysis.markFailed("Could not queue analysis");
+            repository.save(analysis);
+            throw new AnalysisQueueUnavailableException(e);
         }
-
-        CompatibilityAnalysis saved = repository.save(analysis);
-        return toResponse(saved);
+        return new AnalysisAcceptedResponse(analysis.getId(), analysis.getStatus());
     }
 
     // Keeps the session open while toResponse reads the lazy suggestions collection; with
-    // open-in-view off, findById's session is otherwise already closed by then. analyze() needs
-    // no equivalent: the entity it maps is the one it just built, suggestions already in memory.
+    // open-in-view off, findById's session is otherwise already closed by then.
     @Transactional(readOnly = true)
     public AnalyzeResponse getById(UUID id, String callerEmail) {
         return toResponse(findOwned(id, callerEmail));
@@ -108,13 +100,18 @@ public class CompatibilityAnalysisService {
     }
 
     private AnalyzeResponse toResponse(CompatibilityAnalysis analysis) {
-        List<SuggestionResponse> suggestions = analysis.getSuggestions().stream()
-                .map(s -> new SuggestionResponse(s.getJdRequirement(), s.getSuggestion()))
-                .toList();
+        // Null rather than an empty list before completion: "no gaps found" and "not scored yet"
+        // must not look the same to a caller.
+        List<SuggestionResponse> suggestions = analysis.getStatus() == AnalysisStatus.COMPLETED
+                ? analysis.getSuggestions().stream()
+                        .map(s -> new SuggestionResponse(s.getJdRequirement(), s.getSuggestion()))
+                        .toList()
+                : null;
         return new AnalyzeResponse(
                 analysis.getId(), analysis.getJdId(), analysis.getResumeId(),
+                analysis.getStatus(), analysis.getFailureReason(),
                 analysis.getSkillsOverlap(), analysis.getExperienceMatch(),
                 analysis.getKeywordCoverage(), analysis.getSemanticSimilarity(),
-                suggestions, analysis.getCreatedAt());
+                suggestions, analysis.getCreatedAt(), analysis.getCompletedAt());
     }
 }

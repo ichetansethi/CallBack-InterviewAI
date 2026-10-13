@@ -53,6 +53,12 @@
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
+        <!-- Queues analyses on analysis-requested and consumes them in the same service -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+
         <!-- Ollama: used for local embeddings only (nomic-embed-text) — chat is routed to Groq -->
         <dependency>
             <groupId>org.springframework.ai</groupId>
