@@ -18,7 +18,12 @@ public class JwtValidator {
     private final PublicKey publicKey;
 
     public JwtValidator() {
-        this.publicKey = RsaPublicKeyLoader.loadFromClasspath();
+        this(RsaPublicKeyLoader.loadFromClasspath());
+    }
+
+    /** For tests, which sign with a throwaway key pair (the real private key lives only in auth-service). */
+    JwtValidator(PublicKey publicKey) {
+        this.publicKey = publicKey;
     }
 
     private Claims parse(String token) {
