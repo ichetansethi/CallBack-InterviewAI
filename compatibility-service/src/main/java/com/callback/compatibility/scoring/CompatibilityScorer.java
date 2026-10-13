@@ -3,6 +3,7 @@ package com.callback.compatibility.scoring;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -63,10 +64,16 @@ public class CompatibilityScorer {
     });
 
     private final ChatClient chatClient;
-    private final RateLimitBackoff backoff = new RateLimitBackoff();
+    private final RateLimitBackoff backoff;
 
+    @Autowired
     public CompatibilityScorer(ChatClient.Builder chatClientBuilder) {
-        this.chatClient = chatClientBuilder.build();
+        this(chatClientBuilder.build(), new RateLimitBackoff());
+    }
+
+    CompatibilityScorer(ChatClient chatClient, RateLimitBackoff backoff) {
+        this.chatClient = chatClient;
+        this.backoff = backoff;
     }
 
     private <T> T callWithTimeout(Supplier<T> modelCall) {
@@ -118,9 +125,10 @@ public class CompatibilityScorer {
             judgeRequirementOnce(re).ifPresent(votes::add);
         }
         if (votes.isEmpty()) {
-            log.warn("All {} judgment votes failed for requirement \"{}\"; defaulting to supported=true",
-                    JUDGMENT_VOTES, re.requirement());
-            return new Judgment(true, "");
+            // Counting an unjudged requirement as met would save a COMPLETED analysis with inflated
+            // scores and a missing gap, indistinguishable from a real result. Failing it is honest.
+            throw new IllegalStateException("All " + JUDGMENT_VOTES
+                    + " judgment votes failed for requirement \"" + re.requirement() + "\"");
         }
 
         long supportedVotes = votes.stream().filter(Judgment::supported).count();

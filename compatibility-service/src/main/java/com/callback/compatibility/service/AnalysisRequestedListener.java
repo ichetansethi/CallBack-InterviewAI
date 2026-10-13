@@ -1,6 +1,7 @@
 package com.callback.compatibility.service;
 
 import com.callback.compatibility.DTO.AnalysisRequestedEvent;
+import com.callback.compatibility.scoring.GroqQuotaExhaustedException;
 import com.callback.compatibility.scoring.ScoreBreakdown;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,6 +25,7 @@ public class AnalysisRequestedListener {
 
     private static final Logger log = LoggerFactory.getLogger(AnalysisRequestedListener.class);
     static final String FAILURE_REASON = "Analysis could not be completed";
+    static final String QUOTA_FAILURE_REASON = "The AI provider's daily quota is used up; submit the analysis again later";
 
     private final AnalysisPipeline pipeline;
     private final AnalysisStateWriter stateWriter;
@@ -49,6 +51,10 @@ public class AnalysisRequestedListener {
             ScoreBreakdown result = pipeline.run(event.jdText(), event.resumeText(), event.resumeId());
             stateWriter.complete(analysisId, result);
             log.info("Analysis {} completed in {}s", analysisId, (System.nanoTime() - startNanos) / 1_000_000_000);
+        } catch (GroqQuotaExhaustedException e) {
+            log.warn("Analysis {} failed after {}s: {}", analysisId,
+                    (System.nanoTime() - startNanos) / 1_000_000_000, e.getMessage());
+            stateWriter.fail(analysisId, QUOTA_FAILURE_REASON);
         } catch (Exception e) {
             log.error("Analysis {} failed after {}s", analysisId, (System.nanoTime() - startNanos) / 1_000_000_000, e);
             stateWriter.fail(analysisId, FAILURE_REASON);

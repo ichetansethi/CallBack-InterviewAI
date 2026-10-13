@@ -41,6 +41,9 @@ public class RequirementExtractor {
             } catch (RuntimeException e) {
                 lastFailure = e;
                 log.warn("Requirement extraction attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, e.toString());
+                if (RateLimitBackoff.isDailyQuota(e)) {
+                    throw new GroqQuotaExhaustedException(e);
+                }
                 if (attempt < MAX_ATTEMPTS) {
                     backoff.waitBeforeRetry(e);
                 }

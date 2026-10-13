@@ -8,6 +8,8 @@ package com.callback.compatibility.scoring;
  * Spring AI treats a 429 as non-transient and never retries it itself, so without this a single
  * 429 fails the whole analysis. That happens routinely once analyses are queued: the next one
  * starts the instant the previous one has used up the minute's requests.
+ *
+ * A 429 for the daily limit is not waited out: see GroqQuotaExhaustedException.
  */
 class RateLimitBackoff {
 
@@ -28,7 +30,16 @@ class RateLimitBackoff {
         return message.contains("429") || message.toLowerCase().contains("rate_limit");
     }
 
+    /** Groq names the window in the 429 body: "tokens per day (TPD)" or "requests per day (RPD)". */
+    static boolean isDailyQuota(RuntimeException failure) {
+        return isRateLimit(failure) && String.valueOf(failure.getMessage()).contains(" per day (");
+    }
+
+    /** Throws GroqQuotaExhaustedException instead of waiting when the daily quota is used up. */
     void waitBeforeRetry(RuntimeException failure) {
+        if (isDailyQuota(failure)) {
+            throw new GroqQuotaExhaustedException(failure);
+        }
         try {
             Thread.sleep(isRateLimit(failure) ? rateLimitWaitMillis : otherWaitMillis);
         } catch (InterruptedException e) {
