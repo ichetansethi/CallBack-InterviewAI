@@ -4,6 +4,7 @@ import com.callback.question.DTO.CompatibilityAnalysisResponse;
 import com.callback.question.DTO.QuestionGenerateRequest;
 import com.callback.question.DTO.QuestionSetResponse;
 import com.callback.question.client.CompatibilityClient;
+import com.callback.question.exception.AnalysisNotReadyException;
 import com.callback.question.client.JdResumeClient;
 import com.callback.question.model.InterviewQuestion;
 import com.callback.question.repository.InterviewQuestionRepository;
@@ -18,6 +19,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.when;
 
 /**
@@ -100,11 +102,12 @@ class QuestionSetServiceTest {
 
         CompatibilityAnalysisResponse analysis = new CompatibilityAnalysisResponse(
                 compatibilityAnalysisId, jdId, UUID.randomUUID(),
+                "COMPLETED", null,
                 70, 65, 60, 75,
                 List.of(new CompatibilityAnalysisResponse.SuggestionResponse(
                         "Terraform and Ansible infrastructure-as-code",
                         "Add resume content that specifically addresses: Terraform and Ansible infrastructure-as-code")),
-                Instant.now());
+                Instant.now(), Instant.now());
         when(compatibilityClient.getAnalysis(compatibilityAnalysisId, bearerToken)).thenReturn(analysis);
 
         QuestionGenerateRequest request = new QuestionGenerateRequest(jdId, compatibilityAnalysisId);
@@ -121,5 +124,23 @@ class QuestionSetServiceTest {
         assertThat(questionSetRepository.findById(response.id()).orElseThrow().getCompatibilityAnalysisId())
                 .isEqualTo(compatibilityAnalysisId);
         org.mockito.Mockito.verify(compatibilityClient).getAnalysis(compatibilityAnalysisId, bearerToken);
+    }
+
+    /** A not-yet-completed analysis stops generation before anything is generated or saved. */
+    @Test
+    void anAnalysisThatIsNotReadyStopsGenerationBeforeAnythingIsSaved() {
+        UUID jdId = UUID.randomUUID();
+        UUID compatibilityAnalysisId = UUID.randomUUID();
+        String bearerToken = "Bearer caller-jwt";
+        String owner = "not-ready-" + UUID.randomUUID() + "@example.com";
+        when(jdResumeClient.getJdText(jdId, bearerToken)).thenReturn("Senior Backend Engineer. Requirements: Java.");
+        when(compatibilityClient.getAnalysis(compatibilityAnalysisId, bearerToken))
+                .thenThrow(new AnalysisNotReadyException("Compatibility analysis " + compatibilityAnalysisId + " is PENDING"));
+
+        QuestionGenerateRequest request = new QuestionGenerateRequest(jdId, compatibilityAnalysisId);
+
+        assertThatThrownBy(() -> questionSetService.generate(request, owner, bearerToken))
+                .isInstanceOf(AnalysisNotReadyException.class);
+        assertThat(questionSetRepository.findByOwnerEmail(owner)).isEmpty();
     }
 }

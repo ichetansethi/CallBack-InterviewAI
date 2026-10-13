@@ -1,6 +1,7 @@
 package com.callback.question.client;
 
 import com.callback.question.DTO.CompatibilityAnalysisResponse;
+import com.callback.question.exception.AnalysisNotReadyException;
 import com.callback.question.exception.UpstreamNotFoundException;
 import com.callback.question.exception.UpstreamUnauthorizedException;
 import org.junit.jupiter.api.Test;
@@ -48,12 +49,15 @@ class CompatibilityClientTest {
                   "id": "%s",
                   "jdId": "%s",
                   "resumeId": "%s",
+                  "status": "COMPLETED",
+                  "failureReason": null,
                   "skillsOverlap": 80,
                   "experienceMatch": 70,
                   "keywordCoverage": 60,
                   "semanticSimilarity": 90,
                   "suggestions": [{"jdRequirement": "Kubernetes", "suggestion": "Add a K8s project"}],
-                  "createdAt": "2026-01-01T00:00:00Z"
+                  "createdAt": "2026-01-01T00:00:00Z",
+                  "completedAt": "2026-01-01T00:01:30Z"
                 }
                 """.formatted(ANALYSIS_ID, UUID.randomUUID(), UUID.randomUUID());
 
@@ -92,6 +96,69 @@ class CompatibilityClientTest {
 
         assertThatThrownBy(() -> client.getAnalysis(ANALYSIS_ID, TOKEN))
                 .isInstanceOf(UpstreamNotFoundException.class);
+        serverHolder[0].verify();
+    }
+
+    /** What compatibility-service returns while an analysis is queued or running: null scores and suggestions. */
+    private static String unfinishedBody(String status, String failureReason) {
+        return """
+                {
+                  "id": "%s", "jdId": "%s", "resumeId": "%s",
+                  "status": "%s", "failureReason": %s,
+                  "skillsOverlap": null, "experienceMatch": null, "keywordCoverage": null, "semanticSimilarity": null,
+                  "suggestions": null,
+                  "createdAt": "2026-01-01T00:00:00Z", "completedAt": null
+                }
+                """.formatted(ANALYSIS_ID, UUID.randomUUID(), UUID.randomUUID(), status,
+                failureReason == null ? "null" : "\"" + failureReason + "\"");
+    }
+
+    @Test
+    void aPendingOrInProgressAnalysisIsNotReadyRatherThanANullPointer() {
+        for (String status : new String[] {"PENDING", "IN_PROGRESS"}) {
+            MockRestServiceServer[] serverHolder = new MockRestServiceServer[1];
+            CompatibilityClient client = client(serverHolder);
+            serverHolder[0].expect(requestTo("http://compatibility-service/compatibility/" + ANALYSIS_ID))
+                    .andRespond(withSuccess(unfinishedBody(status, null), MediaType.APPLICATION_JSON));
+
+            assertThatThrownBy(() -> client.getAnalysis(ANALYSIS_ID, TOKEN))
+                    .isInstanceOf(AnalysisNotReadyException.class)
+                    .hasMessageContaining(status)
+                    .hasMessageContaining("retry once it completes");
+            serverHolder[0].verify();
+        }
+    }
+
+    @Test
+    void aFailedAnalysisIsNotReadyAndSaysToResubmit() {
+        MockRestServiceServer[] serverHolder = new MockRestServiceServer[1];
+        CompatibilityClient client = client(serverHolder);
+        serverHolder[0].expect(requestTo("http://compatibility-service/compatibility/" + ANALYSIS_ID))
+                .andRespond(withSuccess(unfinishedBody("FAILED", "Analysis could not be completed"), MediaType.APPLICATION_JSON));
+
+        assertThatThrownBy(() -> client.getAnalysis(ANALYSIS_ID, TOKEN))
+                .isInstanceOf(AnalysisNotReadyException.class)
+                .hasMessageContaining("submit a new one");
+        serverHolder[0].verify();
+    }
+
+    /** A compatibility-service from before async analysis sends no status; its analyses are always finished. */
+    @Test
+    void aResponseWithoutStatusIsTreatedAsCompleted() {
+        MockRestServiceServer[] serverHolder = new MockRestServiceServer[1];
+        CompatibilityClient client = client(serverHolder);
+        String legacyBody = """
+                {
+                  "id": "%s", "jdId": "%s", "resumeId": "%s",
+                  "skillsOverlap": 80, "experienceMatch": 70, "keywordCoverage": 60, "semanticSimilarity": 90,
+                  "suggestions": [{"jdRequirement": "Kubernetes", "suggestion": "Add a K8s project"}],
+                  "createdAt": "2026-01-01T00:00:00Z"
+                }
+                """.formatted(ANALYSIS_ID, UUID.randomUUID(), UUID.randomUUID());
+        serverHolder[0].expect(requestTo("http://compatibility-service/compatibility/" + ANALYSIS_ID))
+                .andRespond(withSuccess(legacyBody, MediaType.APPLICATION_JSON));
+
+        assertThat(client.getAnalysis(ANALYSIS_ID, TOKEN).uncoveredRequirements()).containsExactly("Kubernetes");
         serverHolder[0].verify();
     }
 }

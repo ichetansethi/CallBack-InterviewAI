@@ -1,6 +1,7 @@
 package com.callback.question.client;
 
 import com.callback.question.DTO.CompatibilityAnalysisResponse;
+import com.callback.question.exception.AnalysisNotReadyException;
 import com.callback.question.exception.UpstreamNotFoundException;
 import com.callback.question.exception.UpstreamServiceException;
 import com.callback.question.exception.UpstreamUnauthorizedException;
@@ -27,7 +28,18 @@ public class CompatibilityClient {
         this.restClient = restClient;
     }
 
+    /** Returns only a COMPLETED analysis; anything else is an {@link AnalysisNotReadyException} (409). */
     public CompatibilityAnalysisResponse getAnalysis(UUID analysisId, String bearerToken) {
+        CompatibilityAnalysisResponse analysis = fetch(analysisId, bearerToken);
+        if (!analysis.isCompleted()) {
+            throw new AnalysisNotReadyException("FAILED".equals(analysis.status())
+                    ? "Compatibility analysis " + analysisId + " failed; submit a new one"
+                    : "Compatibility analysis " + analysisId + " is " + analysis.status() + "; retry once it completes");
+        }
+        return analysis;
+    }
+
+    private CompatibilityAnalysisResponse fetch(UUID analysisId, String bearerToken) {
         try {
             return restClient.get()
                     .uri("/compatibility/" + analysisId)
