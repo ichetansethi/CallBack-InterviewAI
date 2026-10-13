@@ -36,6 +36,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.matchesPattern;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
@@ -56,6 +57,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class AuthControllerTest {
 
     private static final String PASSWORD = "correct-horse-battery";
+    private static final String UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
     @Autowired
     private MockMvc mockMvc;
@@ -90,7 +92,7 @@ class AuthControllerTest {
     void registerReturns201AndStoresABcryptHashFromTheSharedEncoder() throws Exception {
         register(email, PASSWORD)
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.id").isNumber())
+                .andExpect(jsonPath("$.id").value(matchesPattern(UUID_PATTERN)))
                 .andExpect(jsonPath("$.email").value(email))
                 .andExpect(jsonPath("$.createdAt").isNotEmpty())
                 .andExpect(jsonPath("$.password").doesNotExist())
