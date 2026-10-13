@@ -55,7 +55,7 @@ class SessionCompletedEventMapperTest {
         InterviewSessionState noQuestions = InterviewSessionState.newSession("s", "a@test.com", List.of())
                 .withTurn(new TurnRecord("hi", "advance", "q"));
         InterviewSessionState legacyNull = new InterviewSessionState("s", "a@test.com", 0, List.of(), null, 0, 0,
-                noQuestions.createdAt(), noQuestions.updatedAt())
+                noQuestions.createdAt(), noQuestions.updatedAt(), null)
                 .withTurn(new TurnRecord("hi", "follow_up", "q"));
 
         for (InterviewSessionState state : List.of(noQuestions, legacyNull)) {

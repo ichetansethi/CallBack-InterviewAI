@@ -14,7 +14,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * With no broker reachable, publishing must fail promptly (bounded by KafkaProducerConfig's
- * max.block.ms, not Kafka's 60s default) and leave the transcript in Redis rather than losing it.
+ * max.block.ms, not Kafka's 60s default) and leave the transcript in Redis rather than losing it,
+ * together with the history id its retry must reuse.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
         properties = "spring.kafka.bootstrap-servers=localhost:1")
@@ -44,7 +45,11 @@ class SessionCompletedPublisherBrokerDownTest {
         Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
 
         assertThat(elapsed).isLessThan(Duration.ofSeconds(20));
-        assertThat(redisTemplate.hasKey("voice:session:" + redisSessionId).block()).isTrue();
+        InterviewSessionState kept = redisTemplate.opsForValue().get("voice:session:" + redisSessionId).block();
+        assertThat(kept).isNotNull();
+        assertThat(kept.history()).isEqualTo(finished.history());
+        // Saved before the send, so the retry on the next connection reuses it.
+        assertThat(kept.completedSessionId()).isNotNull();
         sessionRepository.delete(redisSessionId).block();
     }
 }

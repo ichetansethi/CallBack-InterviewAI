@@ -83,7 +83,7 @@ class InterviewSessionStateTest {
         // Simulates a state deserialized from Redis data written before the questions field
         // existed — Jackson leaves it null rather than failing on the missing property.
         InterviewSessionState state = new InterviewSessionState("s1", "a@test.com", 0, List.of(),
-                null, 0, 0, java.time.Instant.now(), java.time.Instant.now());
+                null, 0, 0, java.time.Instant.now(), java.time.Instant.now(), null);
 
         InterviewSessionState result = state.withTurn(new TurnRecord("answer", "advance", "next"));
 
@@ -136,4 +136,18 @@ class InterviewSessionStateTest {
         assertThat(state.followUpCountForCurrentQuestion()).isZero();
     }
 
+
+    @Test
+    void hasEndedOnceTheClosingTurnIsSavedEvenBeforeAHistoryIdIsAssigned() {
+        InterviewSessionState inProgress = InterviewSessionState.newSession("s1", "a@test.com", THREE_QUESTIONS)
+                .withTurn(new TurnRecord("hi", "advance", "q1"));
+        InterviewSessionState ended = inProgress.withTurn(new TurnRecord("done", "end", "bye"));
+        java.util.UUID historyId = java.util.UUID.randomUUID();
+
+        assertThat(InterviewSessionState.newSession("s1", "a@test.com", THREE_QUESTIONS).hasEnded()).isFalse();
+        assertThat(inProgress.hasEnded()).isFalse();
+        assertThat(ended.hasEnded()).isTrue();
+        assertThat(ended.withCompletedSessionId(historyId).completedSessionId()).isEqualTo(historyId);
+        assertThat(ended.withCompletedSessionId(historyId).history()).isEqualTo(ended.history());
+    }
 }

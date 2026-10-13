@@ -19,10 +19,16 @@ import java.util.UUID;
  * reused whenever the same candidate practises the same question set again, so deriving the id
  * from it would make session-history-service's idempotency check silently drop every later run.
  *
+ * <p>That UUID is minted once per run and saved into the Redis state before the first send. A
+ * re-publish of the same run (after a failed Redis delete, an ambiguous send timeout, or a
+ * reconnect to an ended session — see VoiceWebSocketHandler) reuses it, so the duplicate lands on
+ * the same key and session-history-service drops it. A fresh UUID per attempt would instead look
+ * like a second interview.
+ *
  * <p>The Redis session is deleted only after the broker acknowledges the event, so the next
  * connection starts a fresh interview instead of appending to a finished one. If publishing fails
- * the session is left in Redis (transcript kept until the TTL) and the error propagates for the
- * caller to log.
+ * the session is left in Redis (transcript and history id kept until the TTL) and the error
+ * propagates for the caller to log.
  */
 @Component
 public class SessionCompletedPublisher {
@@ -43,12 +49,17 @@ public class SessionCompletedPublisher {
 
     /** Emits the published event's sessionId once the broker has acknowledged it and Redis is cleared. */
     public Mono<UUID> publishCompleted(InterviewSessionState state, UUID questionSetId) {
-        SessionCompletedEvent event = SessionCompletedEventMapper.toEvent(state, UUID.randomUUID(), questionSetId);
+        InterviewSessionState completed = state.completedSessionId() != null
+                ? state
+                : state.withCompletedSessionId(UUID.randomUUID());
+        SessionCompletedEvent event = SessionCompletedEventMapper.toEvent(completed, completed.completedSessionId(), questionSetId);
         String key = event.sessionId().toString();
 
-        // send() itself can block (metadata fetch) — keep it off the Netty event loop.
-        return Mono.defer(() -> Mono.fromFuture(kafkaTemplate.send(topic, key, event)))
-                .subscribeOn(Schedulers.boundedElastic())
+        // Persist the id before sending: if the send's outcome is lost, the retry must reuse it.
+        return sessionRepository.save(completed)
+                // send() itself can block (metadata fetch) — keep it off the Netty event loop.
+                .then(Mono.defer(() -> Mono.fromFuture(kafkaTemplate.send(topic, key, event)))
+                        .subscribeOn(Schedulers.boundedElastic()))
                 .doOnNext(result -> log.info("Published session-completed {} for {} ({} turns) to {}-{}@{}",
                         key, state.sessionId(), event.transcript().size(), result.getRecordMetadata().topic(),
                         result.getRecordMetadata().partition(), result.getRecordMetadata().offset()))

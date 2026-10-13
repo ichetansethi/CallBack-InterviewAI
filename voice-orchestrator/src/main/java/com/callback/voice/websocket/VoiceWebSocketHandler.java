@@ -87,7 +87,11 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
         String bearerToken = "Bearer " + token;
 
         return questionServiceClient.getQuestionSet(questionSetId, bearerToken)
-                .flatMap(qs -> sessionRepository.loadOrCreate(sessionId, ownerEmail, qs.questions()))
+                .flatMap(qs -> sessionRepository.loadOrCreate(sessionId, ownerEmail, qs.questions())
+                        .flatMap(state -> state.hasEnded()
+                                ? finishPendingHandOff(state, questionSetId)
+                                        .then(sessionRepository.loadOrCreate(sessionId, ownerEmail, qs.questions()))
+                                : Mono.just(state)))
                 .flatMap(state -> runInterview(session, state, questionSetId))
                 .onErrorResume(QuestionSetNotFoundException.class, e ->
                         session.close(CloseStatus.POLICY_VIOLATION.withReason("question set not found or not owned")))
@@ -95,6 +99,19 @@ public class VoiceWebSocketHandler implements WebSocketHandler {
                     log.error("Failed to initialize session for question set {}: {}", questionSetId, e.toString());
                     return session.close(CloseStatus.SERVER_ERROR);
                 });
+    }
+
+    /**
+     * The interview in Redis already ended, but its hand-off didn't finish (publish failed, the
+     * Redis delete failed, or the service died in between). Never resume it: re-publish under the
+     * history id it already has (a no-op downstream if the first send did land), clear it, and
+     * let the caller start a fresh interview. If this publish fails too, the connection closes
+     * with the session still in Redis for the next attempt.
+     */
+    private Mono<Void> finishPendingHandOff(InterviewSessionState ended, UUID questionSetId) {
+        log.info("Session {} reconnected after its interview ended; finishing hand-off (history id {})",
+                ended.sessionId(), ended.completedSessionId());
+        return sessionCompletedPublisher.publishCompleted(ended, questionSetId).then();
     }
 
     private Mono<Void> runInterview(WebSocketSession session, InterviewSessionState state, UUID questionSetId) {

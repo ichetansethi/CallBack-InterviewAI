@@ -20,9 +20,11 @@ import org.springframework.test.context.DynamicPropertySource;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -86,7 +88,7 @@ class SessionCompletedPublisherTest {
 
         UUID publishedId = publisher.publishCompleted(finished, questionSetId).block(Duration.ofSeconds(20));
 
-        ConsumerRecord<String, String> record = readSingleRecord();
+        ConsumerRecord<String, String> record = readRecords(r -> r.key().equals(publishedId.toString()), 1).getFirst();
         assertThat(record.key()).isEqualTo(publishedId.toString());
         assertThat(record.headers().lastHeader("__TypeId__")).isNull();
 
@@ -115,19 +117,33 @@ class SessionCompletedPublisherTest {
     }
 
     @Test
-    void eachCompletedRunOfTheSameRedisSessionGetsItsOwnHistoryId() {
+    void rePublishingAnEndedRunReusesItsHistoryIdButANewRunGetsItsOwn() throws Exception {
         String owner = "publisher-" + UUID.randomUUID() + "@example.com";
         UUID questionSetId = UUID.randomUUID();
-        InterviewSessionState run = InterviewSessionState.newSession(owner + "::" + questionSetId, owner, List.of())
+        String redisSessionId = owner + "::" + questionSetId;
+        InterviewSessionState run = InterviewSessionState.newSession(redisSessionId, owner, List.of())
                 .withTurn(new TurnRecord("hi", "end", "bye"));
 
         UUID first = publisher.publishCompleted(run, questionSetId).block(Duration.ofSeconds(20));
-        UUID second = publisher.publishCompleted(run, questionSetId).block(Duration.ofSeconds(20));
+        // What Redis still holds if the broker acked but the delete then failed: the same run,
+        // with the id the publisher saved before sending.
+        InterviewSessionState leftInRedis = run.withCompletedSessionId(first);
+        UUID retried = publisher.publishCompleted(leftInRedis, questionSetId).block(Duration.ofSeconds(20));
+        UUID nextRun = publisher.publishCompleted(InterviewSessionState.newSession(redisSessionId, owner, List.of())
+                .withTurn(new TurnRecord("again", "end", "bye")), questionSetId).block(Duration.ofSeconds(20));
 
-        assertThat(first).isNotEqualTo(second);
+        assertThat(retried).isEqualTo(first);
+        assertThat(nextRun).isNotEqualTo(first);
+        List<ConsumerRecord<String, String>> duplicates = readRecords(r -> r.key().equals(first.toString()), 2);
+        assertThat(duplicates).hasSize(2);
+        for (ConsumerRecord<String, String> record : duplicates) {
+            assertThat(objectMapper.readTree(record.value()).get("sessionId").asText()).isEqualTo(first.toString());
+        }
+        assertThat(redisTemplate.hasKey("voice:session:" + redisSessionId).block()).isFalse();
     }
 
-    private ConsumerRecord<String, String> readSingleRecord() {
+    /** Reads from the start of the topic until {@code count} records match, or fails after 15s. */
+    private List<ConsumerRecord<String, String>> readRecords(Predicate<ConsumerRecord<String, String>> filter, int count) {
         Map<String, Object> props = Map.of(
                 ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaAdmin.getConfigurationProperties().get("bootstrap.servers"),
                 ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
@@ -137,14 +153,19 @@ class SessionCompletedPublisherTest {
             TopicPartition partition = new TopicPartition(TOPIC, 0);
             consumer.assign(List.of(partition));
             consumer.seekToBeginning(List.of(partition));
+            List<ConsumerRecord<String, String>> matched = new ArrayList<>();
             Instant deadline = Instant.now().plusSeconds(15);
             while (Instant.now().isBefore(deadline)) {
-                var records = consumer.poll(Duration.ofMillis(500));
-                if (!records.isEmpty()) {
-                    return records.iterator().next();
+                consumer.poll(Duration.ofMillis(500)).forEach(r -> {
+                    if (filter.test(r)) {
+                        matched.add(r);
+                    }
+                });
+                if (matched.size() >= count) {
+                    return matched;
                 }
             }
         }
-        throw new AssertionError("No record on " + TOPIC + " within 15s");
+        throw new AssertionError("Fewer than " + count + " matching record(s) on " + TOPIC + " within 15s");
     }
 }

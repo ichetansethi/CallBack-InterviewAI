@@ -5,6 +5,7 @@ import com.callback.voice.DTO.InterviewQuestionDto;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * {@code questions} is the prepared question list fetched from question-service once, at session
@@ -20,16 +21,21 @@ import java.util.List;
  * to 0 whenever the cursor moves. TurnActionPolicy caps it (MAX_FOLLOW_UPS_PER_QUESTION), so a
  * question can't absorb the rest of the interview. Sessions saved to Redis before this field
  * existed deserialize it as 0 (Jackson's default for a missing primitive).
+ *
+ * <p>{@code completedSessionId} is null until the interview ends. SessionCompletedPublisher sets it
+ * (and saves it) before the first send, so every re-publish of that run — after a failed Redis
+ * delete, an ambiguous send timeout, or a reconnect to an already-ended session — carries the same
+ * id, and session-history-service's idempotency on sessionId drops the duplicate.
  */
 public record InterviewSessionState(String sessionId, String ownerEmail, int turnCount, List<TurnRecord> history,
                                      List<InterviewQuestionDto> questions, int currentQuestionIndex,
                                      int followUpCountForCurrentQuestion,
-                                     Instant createdAt, Instant updatedAt) {
+                                     Instant createdAt, Instant updatedAt, UUID completedSessionId) {
 
     public static InterviewSessionState newSession(String sessionId, String ownerEmail,
                                                      List<InterviewQuestionDto> questions) {
         Instant now = Instant.now();
-        return new InterviewSessionState(sessionId, ownerEmail, 0, List.of(), List.copyOf(questions), 0, 0, now, now);
+        return new InterviewSessionState(sessionId, ownerEmail, 0, List.of(), List.copyOf(questions), 0, 0, now, now, null);
     }
 
     /**
@@ -48,7 +54,21 @@ public record InterviewSessionState(String sessionId, String ownerEmail, int tur
                 : followUpCountForCurrentQuestion + ("follow_up".equalsIgnoreCase(turn.action()) ? 1 : 0);
 
         return new InterviewSessionState(sessionId, ownerEmail, turnCount + 1, List.copyOf(updatedHistory),
-                questions, updatedIndex, updatedFollowUps, createdAt, Instant.now());
+                questions, updatedIndex, updatedFollowUps, createdAt, Instant.now(), completedSessionId);
+    }
+
+    public InterviewSessionState withCompletedSessionId(UUID id) {
+        return new InterviewSessionState(sessionId, ownerEmail, turnCount, history, questions, currentQuestionIndex,
+                followUpCountForCurrentQuestion, createdAt, updatedAt, id);
+    }
+
+    /**
+     * True once the model has ended the interview: its closing turn is saved before the hand-off
+     * starts, so a state can be ended without completedSessionId yet (crash before the publish).
+     */
+    public boolean hasEnded() {
+        return completedSessionId != null
+                || (history != null && !history.isEmpty() && "end".equalsIgnoreCase(history.getLast().action()));
     }
 
     /**
