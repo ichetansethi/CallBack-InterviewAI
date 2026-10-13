@@ -58,4 +58,26 @@ class RateLimitBackOffPolicyTest {
         assertThat(elapsedMs).isGreaterThanOrEqualTo(1900);
         assertThat(elapsedMs).isLessThan(3500);
     }
+
+    @Test
+    void failsAtOnceInsteadOfSleepingWhenRetryAfterExceedsMaxWait() {
+        AtomicInteger calls = new AtomicInteger();
+        long start = System.nanoTime();
+
+        // The Retry-After Groq sent on 2026-10-13 once the daily token quota was spent: 17m35s.
+        assertThatThrownBy(() -> template(4).execute(ctx -> {
+            calls.incrementAndGet();
+            throw new GroqRateLimitException("HTTP 429 - tokens per day (TPD)", Duration.ofSeconds(1055));
+        }))
+                .isInstanceOf(GroqQuotaExhaustedException.class)
+                .hasMessageContaining("1055s")
+                .hasMessageContaining("tokens per day (TPD)")
+                .satisfies(e -> assertThat(((GroqQuotaExhaustedException) e).retryAfter())
+                        .isEqualTo(Duration.ofSeconds(1055)));
+
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+        assertThat(calls.get()).isEqualTo(1);
+        assertThat(elapsedMs).isLessThan(1000);
+    }
 }

@@ -19,6 +19,11 @@ public class GroqRateLimitException extends RuntimeException {
         this.retryAfter = retryAfter;
     }
 
+    public GroqRateLimitException(String message, Duration retryAfter, Throwable cause) {
+        super(message, cause);
+        this.retryAfter = retryAfter;
+    }
+
     /** Null if Groq's response didn't carry a (parseable) Retry-After header. */
     public Duration retryAfter() {
         return retryAfter;

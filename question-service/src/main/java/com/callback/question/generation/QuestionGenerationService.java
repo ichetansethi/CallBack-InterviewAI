@@ -31,7 +31,8 @@ import java.util.function.Supplier;
  *   <li>A 429 from Groq (GroqRateLimitException, via ChatModelErrorHandlingConfig) is a provider
  *   rate limit, not a model mistake — retrying it needs to wait out the limit, not give the model
  *   another try. Handled by RATE_LIMIT_RETRY_TEMPLATE, scoped to that exception only, wrapping
- *   just the raw model call in callModel().</li>
+ *   just the raw model call in callModel(). A spent daily quota (GroqQuotaExhaustedException)
+ *   is rethrown at once by both mechanisms: it lasts minutes, not seconds.</li>
  *   <li>A malformed/missing submitQuestions call (or an empty batch) IS a model mistake — retrying
  *   that means asking again, which is what the outer attempt loop in generate() is for. Applying
  *   rate-limit backoff to it would waste time without giving the model any reason to answer
@@ -140,6 +141,8 @@ public class QuestionGenerationService {
                     throw new IllegalStateException("Model submitted an empty question batch");
                 }
                 return batch;
+            } catch (GroqQuotaExhaustedException e) {
+                throw e;
             } catch (RuntimeException e) {
                 lastFailure = e;
                 log.warn("Question generation attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, e.toString());
