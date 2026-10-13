@@ -12,13 +12,9 @@ spring:
   ai:
     model:
       chat: openai
-      embedding: ollama
-    ollama:
-      base-url: http://localhost:11434
-      embedding:
-        model: nomic-embed-text
-      init:
-        pull-model-strategy: never
+      # Nothing here uses embeddings. Without this the OpenAI starter would build an embedding
+      # model pointed at Groq, which has no embeddings endpoint.
+      embedding: none
     openai:
       base-url: https://api.groq.com/openai
       api-key: ${GROQ_API_KEY}

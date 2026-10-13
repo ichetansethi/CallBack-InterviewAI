@@ -3,6 +3,7 @@ package com.callback.compatibility.service;
 import com.callback.compatibility.DTO.AnalysisRequestedEvent;
 import com.callback.compatibility.scoring.GroqQuotaExhaustedException;
 import org.junit.jupiter.api.Test;
+import org.springframework.web.client.ResourceAccessException;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -14,8 +15,8 @@ import static org.mockito.Mockito.when;
 
 /**
  * Which failure reason the listener records, without a broker: AnalysisRequestedListenerTest
- * covers delivery against the real one. A spent daily quota says so and that a later resubmission
- * will work; any other failure keeps the generic reason.
+ * covers delivery against the real one, and AnalysisFailureReasonsTest every reason. A spent daily
+ * quota says so, a failed dependency is named, and a failure from no dependency stays generic.
  */
 class AnalysisRequestedListenerFailureReasonTest {
 
@@ -33,16 +34,28 @@ class AnalysisRequestedListenerFailureReasonTest {
 
         listener.handle(event);
 
-        verify(stateWriter).fail(event.analysisId(), AnalysisRequestedListener.QUOTA_FAILURE_REASON);
+        verify(stateWriter).fail(event.analysisId(), AnalysisFailureReasons.AI_DAILY_QUOTA);
     }
 
     @Test
-    void anyOtherFailureKeepsTheGenericReason() {
+    void aFailedDependencyIsNamed() {
         when(stateWriter.startIfRunnable(event.analysisId())).thenReturn(true);
-        when(pipeline.run(any(), any(), any())).thenThrow(new IllegalStateException("All 3 judgment votes failed"));
+        when(pipeline.run(any(), any(), any())).thenThrow(new AnalysisStageException(
+                AnalysisStageException.Stage.RESUME_SEARCH,
+                new ResourceAccessException("I/O error on POST request for \"http://localhost:11434/api/embed\": null")));
 
         listener.handle(event);
 
-        verify(stateWriter).fail(event.analysisId(), AnalysisRequestedListener.FAILURE_REASON);
+        verify(stateWriter).fail(event.analysisId(), AnalysisFailureReasons.EMBEDDINGS_UNAVAILABLE);
+    }
+
+    @Test
+    void aFailureFromNoDependencyKeepsTheGenericReason() {
+        when(stateWriter.startIfRunnable(event.analysisId())).thenReturn(true);
+        when(pipeline.run(any(), any(), any())).thenThrow(new NullPointerException());
+
+        listener.handle(event);
+
+        verify(stateWriter).fail(event.analysisId(), AnalysisFailureReasons.GENERIC);
     }
 }

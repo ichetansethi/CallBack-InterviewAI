@@ -2,6 +2,7 @@ package com.callback.compatibility.scoring;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.retry.NonTransientAiException;
 
 import java.util.List;
 
@@ -35,6 +36,18 @@ class CompatibilityScorerFailureTest {
         assertThatThrownBy(() -> scorer.score("JD text", EVIDENCE))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("All 3 judgment votes failed for requirement \"Kafka\"");
+    }
+
+    @Test
+    void aRequirementWhoseVotesAllFailKeepsTheLastFailureAsItsCause() {
+        // Without the cause, the failure reason can't tell a rejected API key from bad model output.
+        NonTransientAiException invalidKey = new NonTransientAiException("HTTP 401 - Invalid API Key");
+        when(chatClient.prompt().system(anyString()).user(anyString()).tools(any()).call().content())
+                .thenThrow(invalidKey);
+
+        assertThatThrownBy(() -> scorer.score("JD text", EVIDENCE))
+                .hasMessageContaining("All 3 judgment votes failed")
+                .hasCause(invalidKey);
     }
 
     @Test

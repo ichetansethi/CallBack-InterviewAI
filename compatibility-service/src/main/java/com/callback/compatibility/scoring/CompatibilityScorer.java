@@ -9,7 +9,6 @@ import org.springframework.stereotype.Service;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -121,14 +120,20 @@ public class CompatibilityScorer {
 
     private Judgment judgeRequirement(RequirementEvidence re) {
         List<Judgment> votes = new ArrayList<>();
+        RuntimeException lastVoteFailure = null;
         for (int i = 0; i < JUDGMENT_VOTES; i++) {
-            judgeRequirementOnce(re).ifPresent(votes::add);
+            try {
+                votes.add(judgeRequirementOnce(re));
+            } catch (VoteFailedException e) {
+                lastVoteFailure = e.lastAttemptFailure;
+            }
         }
         if (votes.isEmpty()) {
             // Counting an unjudged requirement as met would save a COMPLETED analysis with inflated
             // scores and a missing gap, indistinguishable from a real result. Failing it is honest.
+            // The cause is kept so the failure reason can tell a rejected key from bad model output.
             throw new IllegalStateException("All " + JUDGMENT_VOTES
-                    + " judgment votes failed for requirement \"" + re.requirement() + "\"");
+                    + " judgment votes failed for requirement \"" + re.requirement() + "\"", lastVoteFailure);
         }
 
         long supportedVotes = votes.stream().filter(Judgment::supported).count();
@@ -147,7 +152,7 @@ public class CompatibilityScorer {
         return new Judgment(false, suggestion);
     }
 
-    private Optional<Judgment> judgeRequirementOnce(RequirementEvidence re) {
+    private Judgment judgeRequirementOnce(RequirementEvidence re) {
         String evidenceText = re.evidenceChunks().isEmpty()
                 ? "(none — retrieval found nothing relevant in the resume)"
                 : String.join(" | ", re.evidenceChunks());
@@ -178,7 +183,7 @@ public class CompatibilityScorer {
                     // treat as a failed attempt rather than surface a useless empty suggestion.
                     throw new IllegalStateException("Model reported unsupported with a blank suggestion");
                 }
-                return Optional.of(judgment);
+                return judgment;
             } catch (RuntimeException e) {
                 lastFailure = e;
                 log.warn("Judgment attempt {}/{} for requirement \"{}\" failed: {}",
@@ -188,7 +193,16 @@ public class CompatibilityScorer {
         }
         log.warn("Judgment vote failed for requirement \"{}\" after {} attempts: {}",
                 re.requirement(), MAX_ATTEMPTS, lastFailure == null ? "unknown" : lastFailure.toString());
-        return Optional.empty();
+        throw new VoteFailedException(lastFailure);
+    }
+
+    /** One vote used up its attempts; the other votes still run. Carries the last attempt's failure. */
+    private static class VoteFailedException extends RuntimeException {
+        private final RuntimeException lastAttemptFailure;
+
+        VoteFailedException(RuntimeException lastAttemptFailure) {
+            this.lastAttemptFailure = lastAttemptFailure;
+        }
     }
 
     private int[] collectScores(String jdText, String evidenceBlock) {

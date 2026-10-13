@@ -310,17 +310,13 @@ the save step.
 
 - `spring-ai-bom` (version `1.0.9`, same as compatibility-service) imported for
   `dependencyManagement`.
-- `spring-ai-starter-model-ollama` / `spring-ai-starter-model-openai` / `spring-ai-vector-store` —
-  present with the same pom comments as compatibility-service ("Ollama: used for local embeddings
-  only... chat is routed to Groq"). **Notably, nothing in this service's actual source code uses
-  `VectorStore`, `SearchRequest`, `Document`, or calls an embedding model at all** — no vector
-  store bean, no RAG, no `@Autowired VectorStore` anywhere. This dependency (and the matching
-  Ollama embedding keys in `application.yml`) appear to be inherited boilerplate carried over from
-  compatibility-service's setup rather than something this service exercises. Question generation
-  runs entirely off the JD text and the (optional) uncovered-requirements list — no retrieval
-  step. If embeddings/vector search are never going to be used here, these dependencies and config
-  keys are candidates for removal; if a future retrieval-augmented question style is planned,
-  document that intent here when it lands.
+- `spring-ai-starter-model-openai` — the Groq chat client. The Ollama starter that was copied over
+  from compatibility-service was removed (2026-10-13): nothing in this service calls an embedding
+  model. Question generation runs entirely off the JD text and the (optional)
+  uncovered-requirements list, with no retrieval step.
+- `spring-ai-vector-store` — still declared, and also unused: nothing here uses `VectorStore`,
+  `SearchRequest` or `Document`. A candidate for removal unless a retrieval-augmented question
+  style is planned.
 - `spring-boot-starter-security` — declared, but see the security gap above; there's no
   `SecurityConfig` consuming it.
 - No `spring-retry` dependency is declared explicitly — `RetryTemplate` and
@@ -347,13 +343,7 @@ spring:
   ai:
     model:
       chat: openai
-      embedding: ollama
-    ollama:
-      base-url: http://localhost:11434
-      embedding:
-        model: nomic-embed-text
-      init:
-        pull-model-strategy: never
+      embedding: none
     openai:
       base-url: https://api.groq.com/openai
       api-key: ${GROQ_API_KEY}
@@ -369,9 +359,9 @@ compatibility-service:
   base-url: http://localhost:8083
 ```
 
-- `spring.ai.model.chat: openai` / `embedding: ollama` — the same dual-starter selector mechanism
-  compatibility-service uses to let both Spring AI starters coexist without a duplicate-bean
-  conflict, even though (per the note above) the embedding half is currently unused here.
+- `spring.ai.model.chat: openai` / `embedding: none` — selects the OpenAI-compatible chat model
+  and turns off embedding auto-configuration. Without `none`, the OpenAI starter would build an
+  embedding model pointed at Groq, which has no embeddings endpoint.
 - `GROQ_API_KEY` — env var only, no literal fallback, same convention as every other Groq-backed
   service in this system.
 - `jd-resume-service.base-url` and `compatibility-service.base-url` are both configured — this is

@@ -11,6 +11,7 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.ai.retry.NonTransientAiException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -93,7 +94,8 @@ class AnalysisRequestedListenerTest {
     void aPipelineFailureIsRecordedOnceAndNeverRedelivered() {
         AnalysisRequestedEvent failing = eventFor(savePending());
         AnalysisRequestedEvent sentinel = eventFor(savePending());
-        when(pipeline.run(any(), any(), eq(failing.resumeId()))).thenThrow(new RuntimeException("HTTP 401 invalid api key"));
+        when(pipeline.run(any(), any(), eq(failing.resumeId()))).thenThrow(new AnalysisStageException(AnalysisStageException.Stage.AI_MODEL,
+                new NonTransientAiException("HTTP 401 - {\"error\":{\"message\":\"Invalid API Key\"}}")));
         when(pipeline.run(any(), any(), eq(sentinel.resumeId()))).thenReturn(result(50));
 
         publish(failing);
@@ -102,7 +104,7 @@ class AnalysisRequestedListenerTest {
         awaitStatus(sentinel.analysisId(), AnalysisStatus.COMPLETED);
         CompatibilityAnalysis failed = repository.findById(failing.analysisId()).orElseThrow();
         assertThat(failed.getStatus()).isEqualTo(AnalysisStatus.FAILED);
-        assertThat(failed.getFailureReason()).isEqualTo(AnalysisRequestedListener.FAILURE_REASON);
+        assertThat(failed.getFailureReason()).isEqualTo(AnalysisFailureReasons.AI_KEY_REJECTED);
         verify(pipeline, times(1)).run(any(), any(), eq(failing.resumeId()));
     }
 

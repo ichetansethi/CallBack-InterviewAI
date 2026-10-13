@@ -18,14 +18,13 @@ import java.util.UUID;
  * Delivery is at-least-once, so this is idempotent: terminal analyses are skipped, and an
  * IN_PROGRESS one (a previous run crashed) runs again from scratch. Failures are recorded as
  * FAILED and never rethrown, because a redelivery would re-run the whole LLM pipeline against the
- * same rate limit; the user resubmits instead.
+ * same rate limit; the user resubmits instead. The failure reason names the dependency that broke
+ * (see AnalysisFailureReasons).
  */
 @Component
 public class AnalysisRequestedListener {
 
     private static final Logger log = LoggerFactory.getLogger(AnalysisRequestedListener.class);
-    static final String FAILURE_REASON = "Analysis could not be completed";
-    static final String QUOTA_FAILURE_REASON = "The AI provider's daily quota is used up; submit the analysis again later";
 
     private final AnalysisPipeline pipeline;
     private final AnalysisStateWriter stateWriter;
@@ -54,10 +53,10 @@ public class AnalysisRequestedListener {
         } catch (GroqQuotaExhaustedException e) {
             log.warn("Analysis {} failed after {}s: {}", analysisId,
                     (System.nanoTime() - startNanos) / 1_000_000_000, e.getMessage());
-            stateWriter.fail(analysisId, QUOTA_FAILURE_REASON);
+            stateWriter.fail(analysisId, AnalysisFailureReasons.AI_DAILY_QUOTA);
         } catch (Exception e) {
             log.error("Analysis {} failed after {}s", analysisId, (System.nanoTime() - startNanos) / 1_000_000_000, e);
-            stateWriter.fail(analysisId, FAILURE_REASON);
+            stateWriter.fail(analysisId, AnalysisFailureReasons.of(e));
         }
     }
 }
