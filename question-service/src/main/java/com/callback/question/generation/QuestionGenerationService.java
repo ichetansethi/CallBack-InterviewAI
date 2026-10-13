@@ -60,9 +60,11 @@ public class QuestionGenerationService {
     /**
      * 1 initial attempt + up to 3 backoff retries (2s, 4s, 8s — or Groq's own Retry-After value,
      * when it sends one; see RateLimitBackOffPolicy) — scoped to GroqRateLimitException only, so a
-     * malformed tool-call response never gets this treatment.
+     * malformed tool-call response never gets this treatment. Package-private so
+     * QuestionGenerationServiceTest's raw nested-list trials can wait out 429s without also
+     * getting generate()'s retry-on-malformed-response loop.
      */
-    private static final RetryTemplate RATE_LIMIT_RETRY_TEMPLATE = RetryTemplate.builder()
+    static final RetryTemplate RATE_LIMIT_RETRY_TEMPLATE = RetryTemplate.builder()
             .maxAttempts(4)
             .retryOn(GroqRateLimitException.class)
             .customBackoff(new RateLimitBackOffPolicy())

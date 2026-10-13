@@ -54,7 +54,8 @@ class QuestionGenerationServiceTest {
      * QuestionGenerationService.buildSystemPrompt/buildUserPrompt, not a hand-duplicated copy that
      * could drift from it), bypassing QuestionGenerationService's own retry loop, which would
      * otherwise mask a flaky first attempt — rather than assuming a bigger hosted model makes it a
-     * non-issue.
+     * non-issue. Only 429s are retried (via RATE_LIMIT_RETRY_TEMPLATE): five back-to-back calls
+     * exceed Groq's 8000 tokens/minute, and a rate limit says nothing about the model's output.
      */
     @Test
     void theNestedListToolCallArgumentComesBackWellFormedAcrossRepeatedCalls() {
@@ -71,12 +72,12 @@ class QuestionGenerationServiceTest {
         for (int i = 1; i <= trials; i++) {
             QuestionBatchRecorder recorder = new QuestionBatchRecorder();
             try {
-                chatClient.prompt()
+                QuestionGenerationService.RATE_LIMIT_RETRY_TEMPLATE.execute(context -> chatClient.prompt()
                         .system(QuestionGenerationService.buildSystemPrompt())
                         .user(QuestionGenerationService.buildUserPrompt(jdText, List.of()))
                         .tools(recorder)
                         .call()
-                        .content();
+                        .content());
 
                 QuestionBatch batch = recorder.result().orElseThrow(() ->
                         new IllegalStateException("Model did not call submitQuestions"));
@@ -90,6 +91,11 @@ class QuestionGenerationServiceTest {
                             .contains(q.category().toLowerCase());
                 }
                 successes++;
+            } catch (GroqRateLimitException e) {
+                // Still rate-limited after the retry template's backoffs: Groq's quota is the
+                // problem, not the nested-list shape, so don't count it as a model failure.
+                throw new IllegalStateException("Trial " + i + " still rate-limited after retries; "
+                        + "check Groq's x-ratelimit-* headers (daily quota may be spent)", e);
             } catch (RuntimeException e) {
                 System.out.println("Trial " + i + " failed to produce a well-formed nested list: " + e);
             }
