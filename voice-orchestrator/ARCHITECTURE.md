@@ -662,9 +662,9 @@ spring:
 server:
   port: 8085
 whisper:
-  base-url: http://localhost:8090
+  base-url: ${WHISPER_BASE_URL:http://localhost:8090}
 piper:
-  base-url: http://localhost:8091
+  base-url: ${PIPER_BASE_URL:http://localhost:8091}
 services:
   question-service:
     base-url: http://localhost:8084
@@ -686,7 +686,10 @@ turn-decision:
 - `whisper.base-url` / `piper.base-url` — plain custom properties, injected via `@Value` into
   `WhisperClientConfig`/`PiperClientConfig`'s respective `WebClient` beans. These point at local
   server-mode instances of whisper.cpp and Piper — infrastructure entirely outside Spring AI's
-  model abstractions.
+  model abstractions. Overridable with `WHISPER_BASE_URL` / `PIPER_BASE_URL`, defaulting to the
+  local ports. Run whisper.cpp on the host rather than in Docker: Docker Desktop's Linux VM has no
+  Metal, so a container is CPU-only — measured 2026-10-17 on jfk.wav (base.en, `/inference`):
+  ~85-120ms on the host (Metal) vs ~810-980ms in a CPU-only container.
 - `services.question-service.base-url` — same `@Value`-into-`WebClient` pattern, injected into
   `QuestionServiceClient`. Port `8084` matches question-service's own `application.yml`.
 - `spring.kafka.bootstrap-servers` — docker-compose's `callback-kafka` host listener.
