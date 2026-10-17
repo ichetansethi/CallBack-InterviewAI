@@ -26,10 +26,10 @@ server:
   port: 8085
 
 whisper:
-  base-url: http://localhost:8090
+  base-url: ${WHISPER_BASE_URL:http://localhost:8090}
 
 piper:
-  base-url: http://localhost:8091
+  base-url: ${PIPER_BASE_URL:http://localhost:8091}
 
 services:
   question-service:

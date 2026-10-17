@@ -38,6 +38,8 @@ class QuestionGenerationServiceTest {
     @Autowired
     private ChatClient.Builder chatClientBuilder;
 
+    private static final long TRIAL_SPACING_MS = 15_000;
+
     private static final Set<String> KNOWN_CATEGORIES = Set.of("technical", "behavioral", "role-specific");
 
     /**
@@ -54,8 +56,9 @@ class QuestionGenerationServiceTest {
      * QuestionGenerationService.buildSystemPrompt/buildUserPrompt, not a hand-duplicated copy that
      * could drift from it), bypassing QuestionGenerationService's own retry loop, which would
      * otherwise mask a flaky first attempt — rather than assuming a bigger hosted model makes it a
-     * non-issue. Only 429s are retried (via RATE_LIMIT_RETRY_TEMPLATE): five back-to-back calls
-     * exceed Groq's 8000 tokens/minute, and a rate limit says nothing about the model's output.
+     * non-issue. Trials are spaced TRIAL_SPACING_MS apart because five back-to-back calls (about
+     * 2k tokens each) exceed Groq's 8000 tokens/minute; any 429 that still happens is retried (via
+     * RATE_LIMIT_RETRY_TEMPLATE), and a rate limit says nothing about the model's output.
      */
     @Test
     void theNestedListToolCallArgumentComesBackWellFormedAcrossRepeatedCalls() {
@@ -70,6 +73,9 @@ class QuestionGenerationServiceTest {
         int successes = 0;
 
         for (int i = 1; i <= trials; i++) {
+            if (i > 1) {
+                pause(TRIAL_SPACING_MS);
+            }
             QuestionBatchRecorder recorder = new QuestionBatchRecorder();
             try {
                 QuestionGenerationService.RATE_LIMIT_RETRY_TEMPLATE.execute(context -> chatClient.prompt()
@@ -107,6 +113,15 @@ class QuestionGenerationServiceTest {
         // retry loop exists precisely to absorb that, but a majority-failing rate here would mean
         // the nested-list shape itself is unreliable, not just noisy.
         assertThat(successes).isGreaterThanOrEqualTo(trials - 1);
+    }
+
+    private static void pause(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while spacing trials", e);
+        }
     }
 
     @Test
