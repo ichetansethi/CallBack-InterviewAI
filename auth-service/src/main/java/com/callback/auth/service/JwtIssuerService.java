@@ -20,7 +20,7 @@ public class JwtIssuerService {
     private final long expirationMs;
 
     public JwtIssuerService(@Value("${jwt.expiration-ms}") long expirationMs) {
-        this.privateKey = RsaPrivateKeyLoader.loadFromClasspath();
+        this.privateKey = RsaPrivateKeyLoader.load();
         this.expirationMs = expirationMs;
     }
 

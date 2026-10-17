@@ -124,9 +124,9 @@ the custom `AuthenticationEntryPoint` (see `SecurityConfig`).
 - **`PrivateKey privateKey`** is parsed once in the constructor (via `common-security`'s
   `PemUtils.readPrivateKey`) and stored `final` — signing is stateless per call, no reason to
   re-parse the PEM file per request.
-- **Private key loaded via `@Value("classpath:keys/private_key.pem") Resource`**, not a
-  `@Value` `String` — lets Spring resolve the classpath resource and hand back an `InputStream`
-  directly, rather than manually building a path.
+- **Private key loaded via `RsaPrivateKeyLoader.load()`**: reads the file named by the
+  `JWT_PRIVATE_KEY_PATH` env var (mount it into the container; keeps the key out of the jar),
+  falling back to the gitignored `keys/private_key.pem` on the classpath for local runs.
 - **`generateToken(subject)`** — subject is the user's **email**, not a numeric/UUID id. Decided
   early to avoid the id-vs-UUID question; email is already unique (`User.email` has a unique
   DB constraint) and needs no extra lookup indirection.
@@ -283,8 +283,8 @@ the custom `AuthenticationEntryPoint` (see `SecurityConfig`).
 ## `application.yml`
 
 - **No `jwt.secret` anymore** — RS256 replaced the HS256 shared secret. The private key is a
-  gitignored file (`auth-service/src/main/resources/keys/private_key.pem`) rather than an env
-  var; see the "Token signing/verification split" section above.
+  file, either mounted and pointed to by `JWT_PRIVATE_KEY_PATH` or, locally, the gitignored
+  `auth-service/src/main/resources/keys/private_key.pem`; see the "Token signing/verification split" section above.
 - **DB credentials (`DB_USERNAME` / `DB_PASSWORD`) do carry defaults** (currently
   `callback_admin` / `callback_password123`) — acceptable for a local-only Postgres instance
   where dev convenience outweighs the near-zero risk, unlike the JWT secret.
