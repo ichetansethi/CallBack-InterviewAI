@@ -3,13 +3,17 @@
 #   docker build -f docker/whisper.Dockerfile -t callback-whisper .
 
 FROM ubuntu:22.04 AS build
-ARG WHISPER_REF=v1.9.3
+# Exact commit of the local whisper.cpp checkout (git describe: v1.9.3-78-g642b5d32).
+ARG WHISPER_COMMIT=642b5d3260e020c2fc6f34a9569d10ddd7672963
 ARG WHISPER_MODEL=base.en
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cmake git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-RUN git clone --depth 1 --branch "${WHISPER_REF}" https://github.com/ggml-org/whisper.cpp.git .
+# Fetching a single commit by SHA keeps the clone shallow; --branch only takes tags and branches.
+RUN git init -q . \
+    && git fetch -q --depth 1 https://github.com/ggml-org/whisper.cpp.git "${WHISPER_COMMIT}" \
+    && git checkout -q FETCH_HEAD
 # Static, portable build (no -march=native) so the image runs on any CPU the VM exposes.
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=OFF \
     && cmake --build build -j --target whisper-server
