@@ -2,7 +2,7 @@ spring:
   application:
     name: auth-service
   datasource:
-    url: jdbc:postgresql://localhost:5432/callback_auth
+    url: ${AUTH_DB_URL:jdbc:postgresql://localhost:5432/callback_auth}
     username: ${DB_USERNAME:callback_admin}
     password: ${DB_PASSWORD:callback_password123}
   jpa:

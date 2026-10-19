@@ -2,7 +2,7 @@ spring:
   application:
     name: session-history-service
   datasource:
-    url: jdbc:postgresql://localhost:5432/callback_session
+    url: ${SESSION_HISTORY_DB_URL:jdbc:postgresql://localhost:5432/callback_session}
     username: ${DB_USERNAME:callback_admin}
     password: ${DB_PASSWORD:callback_password123}
   jpa:
@@ -22,7 +22,7 @@ spring:
       connect-timeout: 5s
       read-timeout: 60s
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
   ai:
     model:
       chat: openai

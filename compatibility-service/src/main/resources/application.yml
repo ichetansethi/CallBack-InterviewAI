@@ -2,7 +2,7 @@ spring:
   application:
     name: compatibility-service
   datasource:
-    url: jdbc:postgresql://localhost:5433/callback_compatibility
+    url: ${COMPATIBILITY_DB_URL:jdbc:postgresql://localhost:5433/callback_compatibility}
     username: ${DB_USERNAME:callback_admin}
     password: ${DB_PASSWORD:callback_password123}
   jpa:
@@ -16,13 +16,13 @@ spring:
     baseline-on-migrate: true
     baseline-version: 1
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
   ai:
     model:
       chat: openai
       embedding: ollama
     ollama:
-      base-url: http://localhost:11434
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
       embedding:
         model: nomic-embed-text
       init:
@@ -45,7 +45,7 @@ server:
   port: 8083
 
 jd-resume-service:
-  base-url: http://localhost:8082
+  base-url: ${JD_RESUME_SERVICE_URL:http://localhost:8082}
 
 compatibility:
   kafka:

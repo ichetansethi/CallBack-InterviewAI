@@ -2,7 +2,7 @@ spring:
   application:
     name: question-service
   datasource:
-    url: jdbc:postgresql://localhost:5432/callback_question
+    url: ${QUESTION_DB_URL:jdbc:postgresql://localhost:5432/callback_question}
     username: ${DB_USERNAME:callback_admin}
     password: ${DB_PASSWORD:callback_password123}
   jpa:
@@ -33,7 +33,7 @@ server:
   port: 8084
 
 jd-resume-service:
-  base-url: http://localhost:8082
+  base-url: ${JD_RESUME_SERVICE_URL:http://localhost:8082}
 
 compatibility-service:
-  base-url: http://localhost:8083
+  base-url: ${COMPATIBILITY_SERVICE_URL:http://localhost:8083}
