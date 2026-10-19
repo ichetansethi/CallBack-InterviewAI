@@ -30,26 +30,26 @@ spring:
                 redis-rate-limiter.requestedTokens: 1
           routes:
             - id: auth
-              uri: http://localhost:8081
+              uri: ${AUTH_SERVICE_URL:http://localhost:8081}
               predicates:
                 - Path=/auth/**
             - id: jd-resume
-              uri: http://localhost:8082
+              uri: ${JD_RESUME_SERVICE_URL:http://localhost:8082}
               predicates:
                 - Path=/jd/**,/resumes/**
             - id: compatibility
-              uri: http://localhost:8083
+              uri: ${COMPATIBILITY_SERVICE_URL:http://localhost:8083}
               predicates:
                 - Path=/compatibility/**
             - id: questions
-              uri: http://localhost:8084
+              uri: ${QUESTION_SERVICE_URL:http://localhost:8084}
               predicates:
                 - Path=/questions/**
             - id: sessions
-              uri: http://localhost:8086
+              uri: ${SESSION_HISTORY_SERVICE_URL:http://localhost:8086}
               predicates:
                 - Path=/sessions/**
             - id: voice
-              uri: ws://localhost:8085
+              uri: ${VOICE_ORCHESTRATOR_URL:ws://localhost:8085}
               predicates:
                 - Path=/voice/**

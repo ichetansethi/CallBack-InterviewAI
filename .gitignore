@@ -11,10 +11,7 @@ auth-service/src/main/resources/keys/private_key.pem
 jd-resume-service/data/
 
 ### IntelliJ IDEA ###
-.idea/modules.xml
-.idea/jarRepositories.xml
-.idea/compiler.xml
-.idea/libraries/
+.idea/
 *.iws
 *.iml
 *.ipr
@@ -43,3 +40,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### Docker compose secrets/config ###
+.env

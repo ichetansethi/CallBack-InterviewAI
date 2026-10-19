@@ -1,9 +1,32 @@
+# Infrastructure (redis, kafka, postgres), the Spring services and the voice sidecars.
+# Everything: `docker compose up --build`. Infra only, for running services from the IDE:
+# `docker compose up redis kafka`. Needs a .env with GROQ_API_KEY (see .env.example).
+
+x-java-service: &java-service
+  restart: unless-stopped
+  depends_on:
+    postgres: {condition: service_healthy}
+    kafka: {condition: service_healthy}
+    redis: {condition: service_healthy}
+
+x-java-env: &java-env
+  DB_USERNAME: ${DB_USERNAME:-callback_admin}
+  DB_PASSWORD: ${DB_PASSWORD:-callback_password123}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  SPRING_DATA_REDIS_HOST: redis
+
 services:
   redis:
     image: redis:7-alpine
     container_name: callback-redis
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   # Single-node Kafka in KRaft mode (no ZooKeeper).
   # Host apps connect on localhost:9092; other compose containers use kafka:29092.
@@ -38,5 +61,152 @@ services:
       retries: 10
       start_period: 20s
 
+
+  postgres:
+    # pgvector build of postgres:16: compatibility-service stores resume embeddings in it.
+    image: pgvector/pgvector:pg16
+    container_name: callback-postgres
+    environment:
+      POSTGRES_USER: ${DB_USERNAME:-callback_admin}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-callback_password123}
+    ports:
+      # 5436: the host's own Postgres uses 5432/5433 and other local containers 5434/5435.
+      - "127.0.0.1:5436:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  auth-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: docker/java-service.Dockerfile
+      args:
+        SERVICE: auth-service
+        MAIN_CLASS: com.callback.auth.AuthServiceApplication
+    environment:
+      <<: *java-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_auth
+      JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private_key
+    secrets:
+      - jwt_private_key
+
+  jd-resume-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: docker/java-service.Dockerfile
+      args:
+        SERVICE: jd-resume-service
+        MAIN_CLASS: com.callback.jd.JdResumeServiceApplication
+    environment:
+      <<: *java-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_jdresume
+    volumes:
+      # Uploaded resumes are written to ./data/resumes relative to the working dir (/app).
+      - resume-data:/app/data
+
+  compatibility-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: docker/java-service.Dockerfile
+      args:
+        SERVICE: compatibility-service
+        MAIN_CLASS: com.callback.compatibility.CompatibilityServiceApplication
+    environment:
+      <<: *java-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_compatibility
+      SPRING_AI_OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      JD_RESUME_SERVICE_BASE_URL: http://jd-resume-service:8082
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  question-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: docker/java-service.Dockerfile
+      args:
+        SERVICE: question-service
+        MAIN_CLASS: com.callback.question.QuestionServiceApplication
+    environment:
+      <<: *java-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_question
+      JD_RESUME_SERVICE_BASE_URL: http://jd-resume-service:8082
+      COMPATIBILITY_SERVICE_BASE_URL: http://compatibility-service:8083
+
+  session-history-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: docker/java-service.Dockerfile
+      args:
+        SERVICE: session-history-service
+        MAIN_CLASS: com.callback.session.SessionHistoryServiceApplication
+    environment:
+      <<: *java-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_session
+
+  voice-orchestrator:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: docker/java-service.Dockerfile
+      args:
+        SERVICE: voice-orchestrator
+        MAIN_CLASS: com.callback.voice.VoiceOrchestratorApplication
+    environment:
+      <<: *java-env
+      SERVICES_QUESTION_SERVICE_BASE_URL: http://question-service:8084
+      WHISPER_BASE_URL: ${WHISPER_BASE_URL:-http://whisper:8090}
+      PIPER_BASE_URL: ${PIPER_BASE_URL:-http://piper:8091}
+
+  gateway:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: docker/java-service.Dockerfile
+      args:
+        SERVICE: gateway
+        MAIN_CLASS: com.callback.gateway.GatewayApplication
+    environment:
+      <<: *java-env
+      AUTH_SERVICE_URL: http://auth-service:8081
+      JD_RESUME_SERVICE_URL: http://jd-resume-service:8082
+      COMPATIBILITY_SERVICE_URL: http://compatibility-service:8083
+      QUESTION_SERVICE_URL: http://question-service:8084
+      SESSION_HISTORY_SERVICE_URL: http://session-history-service:8086
+      VOICE_ORCHESTRATOR_URL: ws://voice-orchestrator:8085
+    ports:
+      # The only service published to the host; everything else is reached through it.
+      - "8080:8080"
+
+  whisper:
+    # CPU only (no Metal in Docker Desktop's VM): ~10x slower than whisper-server on the host.
+    # To use a host whisper-server, set WHISPER_BASE_URL in .env and leave this service out.
+    build:
+      context: .
+      dockerfile: docker/whisper.Dockerfile
+    restart: unless-stopped
+
+  piper:
+    build:
+      context: .
+      dockerfile: docker/piper.Dockerfile
+    restart: unless-stopped
+
+secrets:
+  jwt_private_key:
+    # Never baked into the image (.dockerignore); auth-service reads it via JWT_PRIVATE_KEY_PATH.
+    file: ./auth-service/src/main/resources/keys/private_key.pem
+
 volumes:
+  postgres-data:
+  resume-data:
   kafka-data:

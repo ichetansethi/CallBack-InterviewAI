@@ -1,0 +1,9 @@
+**/target/
+.git
+.idea
+.claude
+**/*.iml
+**/data/
+.env
+# Mounted at runtime via JWT_PRIVATE_KEY_PATH; keep it out of the image and the build context.
+auth-service/src/main/resources/keys/private_key.pem
