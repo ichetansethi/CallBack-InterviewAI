@@ -7,7 +7,11 @@ import com.callback.compatibility.model.CompatibilityAnalysis;
 import com.callback.compatibility.repository.CompatibilityAnalysisRepository;
 import com.callback.compatibility.scoring.ScoreBreakdown;
 import com.callback.compatibility.scoring.TweakSuggestion;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -18,10 +22,12 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +37,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -55,6 +62,9 @@ class AnalysisRequestedListenerTest {
 
     @MockitoBean
     private AnalysisPipeline pipeline;
+
+    @MockitoSpyBean
+    private AnalysisStateWriter stateWriter;
 
     @Autowired
     private KafkaTemplate<String, AnalysisRequestedEvent> kafkaTemplate;
@@ -159,11 +169,53 @@ class AnalysisRequestedListenerTest {
         KafkaTemplate<String, String> raw = new KafkaTemplate<>(new DefaultKafkaProducerFactory<>(
                 Map.of(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers),
                 new StringSerializer(), new StringSerializer()));
-        raw.send(topic, OWNER, "this is not json").join();
+        // Unique per run: the dead-letter topic keeps records from earlier runs.
+        String garbage = "this is not json " + UUID.randomUUID();
+        raw.send(topic, OWNER, garbage).join();
         raw.destroy();
         publish(sentinel);
 
         awaitStatus(sentinel.analysisId(), AnalysisStatus.COMPLETED);
+        assertThat(deadLetters(OWNER, garbage)).hasSize(1);
+    }
+
+    /** What escapes the listener (here: the database failing as the run starts) is retried, then dead-lettered. */
+    @Test
+    void aRecordThatKeepsFailingIsRetriedThenDeadLettered() {
+        AnalysisRequestedEvent doomed = eventFor(savePending());
+        AnalysisRequestedEvent sentinel = eventFor(savePending());
+        when(pipeline.run(any(), any(), any())).thenReturn(result(50));
+        doThrow(new IllegalStateException("database unavailable")).when(stateWriter).startIfRunnable(doomed.analysisId());
+
+        publish(doomed);
+        publish(sentinel);
+
+        awaitStatus(sentinel.analysisId(), AnalysisStatus.COMPLETED);
+        // 1 delivery + 2 retries, all failing before the pipeline starts.
+        verify(stateWriter, times(3)).startIfRunnable(doomed.analysisId());
+        verify(pipeline, never()).run(any(), any(), eq(doomed.resumeId()));
+        assertThat(deadLetters(OWNER, doomed.analysisId().toString())).hasSize(1);
+    }
+
+    /** Reads the whole dead-letter topic with a throwaway group, returning values containing the marker. */
+    private List<String> deadLetters(String key, String marker) {
+        Map<String, Object> props = Map.of(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
+                ConsumerConfig.GROUP_ID_CONFIG, "dlt-reader-" + UUID.randomUUID(),
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props, new StringDeserializer(), new StringDeserializer())) {
+            consumer.subscribe(List.of(topic + ".DLT"));
+            List<String> found = new ArrayList<>();
+            await().atMost(TIMEOUT).until(() -> {
+                for (ConsumerRecord<String, String> r : consumer.poll(Duration.ofMillis(500))) {
+                    if (key.equals(r.key()) && r.value() != null && r.value().contains(marker)) {
+                        found.add(r.value());
+                    }
+                }
+                return !found.isEmpty();
+            });
+            return found;
+        }
     }
 
     private UUID savePending() {
