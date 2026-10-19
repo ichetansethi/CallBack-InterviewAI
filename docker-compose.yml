@@ -13,15 +13,18 @@ x-java-env: &java-env
   DB_USERNAME: ${DB_USERNAME:-callback_admin}
   DB_PASSWORD: ${DB_PASSWORD:-callback_password123}
   GROQ_API_KEY: ${GROQ_API_KEY:-}
-  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-  SPRING_DATA_REDIS_HOST: redis
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  REDIS_HOST: redis
+  JD_RESUME_SERVICE_URL: http://jd-resume-service:8082
+  COMPATIBILITY_SERVICE_URL: http://compatibility-service:8083
+  QUESTION_SERVICE_URL: http://question-service:8084
 
 services:
   redis:
     image: redis:7-alpine
     container_name: callback-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -34,7 +37,7 @@ services:
     image: apache/kafka:3.9.1
     container_name: callback-kafka
     ports:
-      - "9092:9092"
+      - "127.0.0.1:9092:9092"
     volumes:
       - kafka-data:/var/lib/kafka/data
     environment:
@@ -62,6 +65,28 @@ services:
       start_period: 20s
 
 
+  # Embeddings for compatibility-service. No published port: only compose services reach it.
+  # CPU only here; to use the host's Ollama (Metal) instead, set OLLAMA_BASE_URL in .env.
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot: fetches the embedding model into ollama-data, then exits.
+  ollama-pull:
+    image: ollama/ollama
+    environment:
+      OLLAMA_HOST: ollama:11434
+    entrypoint: ["ollama", "pull", "nomic-embed-text"]
+    depends_on:
+      ollama: {condition: service_healthy}
+    restart: "no"
+
   postgres:
     # pgvector build of postgres:16: compatibility-service stores resume embeddings in it.
     image: pgvector/pgvector:pg16
@@ -88,10 +113,9 @@ services:
       dockerfile: docker/java-service.Dockerfile
       args:
         SERVICE: auth-service
-        MAIN_CLASS: com.callback.auth.AuthServiceApplication
     environment:
       <<: *java-env
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_auth
+      AUTH_DB_URL: jdbc:postgresql://postgres:5432/callback_auth
       JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private_key
     secrets:
       - jwt_private_key
@@ -103,10 +127,9 @@ services:
       dockerfile: docker/java-service.Dockerfile
       args:
         SERVICE: jd-resume-service
-        MAIN_CLASS: com.callback.jd.JdResumeServiceApplication
     environment:
       <<: *java-env
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_jdresume
+      JD_RESUME_DB_URL: jdbc:postgresql://postgres:5432/callback_jdresume
     volumes:
       # Uploaded resumes are written to ./data/resumes relative to the working dir (/app).
       - resume-data:/app/data
@@ -118,12 +141,17 @@ services:
       dockerfile: docker/java-service.Dockerfile
       args:
         SERVICE: compatibility-service
-        MAIN_CLASS: com.callback.compatibility.CompatibilityServiceApplication
     environment:
       <<: *java-env
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_compatibility
-      SPRING_AI_OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      JD_RESUME_SERVICE_BASE_URL: http://jd-resume-service:8082
+      COMPATIBILITY_DB_URL: jdbc:postgresql://postgres:5432/callback_compatibility
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+    # Restates the anchor's depends_on (a merge key replaces the whole block, it doesn't extend it).
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      ollama-pull: {condition: service_completed_successfully}
+    # Needed only when OLLAMA_BASE_URL points at host.docker.internal.
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -134,12 +162,9 @@ services:
       dockerfile: docker/java-service.Dockerfile
       args:
         SERVICE: question-service
-        MAIN_CLASS: com.callback.question.QuestionServiceApplication
     environment:
       <<: *java-env
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_question
-      JD_RESUME_SERVICE_BASE_URL: http://jd-resume-service:8082
-      COMPATIBILITY_SERVICE_BASE_URL: http://compatibility-service:8083
+      QUESTION_DB_URL: jdbc:postgresql://postgres:5432/callback_question
 
   session-history-service:
     <<: *java-service
@@ -148,10 +173,9 @@ services:
       dockerfile: docker/java-service.Dockerfile
       args:
         SERVICE: session-history-service
-        MAIN_CLASS: com.callback.session.SessionHistoryServiceApplication
     environment:
       <<: *java-env
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/callback_session
+      SESSION_HISTORY_DB_URL: jdbc:postgresql://postgres:5432/callback_session
 
   voice-orchestrator:
     <<: *java-service
@@ -160,10 +184,8 @@ services:
       dockerfile: docker/java-service.Dockerfile
       args:
         SERVICE: voice-orchestrator
-        MAIN_CLASS: com.callback.voice.VoiceOrchestratorApplication
     environment:
       <<: *java-env
-      SERVICES_QUESTION_SERVICE_BASE_URL: http://question-service:8084
       WHISPER_BASE_URL: ${WHISPER_BASE_URL:-http://whisper:8090}
       PIPER_BASE_URL: ${PIPER_BASE_URL:-http://piper:8091}
 
@@ -174,13 +196,9 @@ services:
       dockerfile: docker/java-service.Dockerfile
       args:
         SERVICE: gateway
-        MAIN_CLASS: com.callback.gateway.GatewayApplication
     environment:
       <<: *java-env
       AUTH_SERVICE_URL: http://auth-service:8081
-      JD_RESUME_SERVICE_URL: http://jd-resume-service:8082
-      COMPATIBILITY_SERVICE_URL: http://compatibility-service:8083
-      QUESTION_SERVICE_URL: http://question-service:8084
       SESSION_HISTORY_SERVICE_URL: http://session-history-service:8086
       VOICE_ORCHESTRATOR_URL: ws://voice-orchestrator:8085
     ports:
@@ -210,3 +228,4 @@ volumes:
   postgres-data:
   resume-data:
   kafka-data:
+  ollama-data:
