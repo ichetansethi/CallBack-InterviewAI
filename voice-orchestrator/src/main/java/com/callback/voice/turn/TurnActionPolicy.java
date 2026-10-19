@@ -29,7 +29,7 @@ public final class TurnActionPolicy {
     public static final String ADVANCE = "advance";
     public static final String END = "end";
 
-    public static final int MAX_FOLLOW_UPS_PER_QUESTION = 3;
+    public static final int MAX_FOLLOW_UPS_PER_QUESTION = 2;
     /** Sessions with no prepared questions: the model ends on judgment, hard-stopped here. */
     static final int NO_QUESTIONS_MAX_EXCHANGES = 8;
 

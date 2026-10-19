@@ -58,12 +58,11 @@ class TurnDecisionGuardTest {
         return InterviewSessionState.newSession("s", "a@test.com", THREE)
                 .withTurn(new TurnRecord("hi", "advance", "q1"))
                 .withTurn(new TurnRecord("vague", "follow_up", "f1"))
-                .withTurn(new TurnRecord("vague", "follow_up", "f2"))
-                .withTurn(new TurnRecord("vague", "follow_up", "f3"));
+                .withTurn(new TurnRecord("vague", "follow_up", "f2"));
     }
 
     @Test
-    void aFourthFollowUpIsRejectedAndTheModelsCompliantRetryIsAccepted() {
+    void aThirdFollowUpIsRejectedAndTheModelsCompliantRetryIsAccepted() {
         STUB.thenDecision("follow_up", "Could you say more?");
         STUB.thenDecision("advance", "q2");
 

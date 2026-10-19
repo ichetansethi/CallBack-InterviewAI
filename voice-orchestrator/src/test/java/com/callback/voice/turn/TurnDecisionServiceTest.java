@@ -82,10 +82,9 @@ class TurnDecisionServiceTest {
                 .withTurn(new TurnRecord("Hi.", "advance", QUESTIONS.get(0).questionText()))
                 .withTurn(new TurnRecord("Solid answer on partitions.", "advance", QUESTIONS.get(1).questionText()))
                 .withTurn(new TurnRecord("Hmm, I'd probably add an index?", "follow_up", "Which index, and how would you confirm it helped?"))
-                .withTurn(new TurnRecord("Not sure, maybe look at the plan.", "follow_up", "What would you look for in the plan?"))
-                .withTurn(new TurnRecord("I don't really remember.", "follow_up", "Have you used EXPLAIN ANALYZE before?"));
+                .withTurn(new TurnRecord("Not sure, maybe look at the plan.", "follow_up", "What would you look for in the plan?"));
         assertThat(state.currentQuestionIndex()).isEqualTo(1);
-        assertThat(state.followUpCountForCurrentQuestion()).isEqualTo(3);
+        assertThat(state.followUpCountForCurrentQuestion()).isEqualTo(2);
 
         // Vague again — exactly the kind of answer that invites another probe.
         TurnDecision decision = decide("Maybe? I'm not sure, sorry.", state);
@@ -104,7 +103,7 @@ class TurnDecisionServiceTest {
         for (int i = 1; i < QUESTIONS.size(); i++) {
             state = state.withTurn(new TurnRecord("A thorough answer.", "advance", QUESTIONS.get(i).questionText()));
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < TurnActionPolicy.MAX_FOLLOW_UPS_PER_QUESTION; i++) {
             state = state.withTurn(new TurnRecord("Something vague.", "follow_up", "Can you be more specific about alerts?"));
         }
 

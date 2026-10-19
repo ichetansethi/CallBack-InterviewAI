@@ -36,7 +36,7 @@ class TurnActionPolicyTest {
 
     @Test
     void midQuestionUnderTheCapAllowsEverything() {
-        assertThat(TurnActionPolicy.allowedActions(withFollowUps(afterOpening(), 2)))
+        assertThat(TurnActionPolicy.allowedActions(withFollowUps(afterOpening(), 1)))
                 .containsExactly("follow_up", "advance", "end");
     }
 
@@ -49,7 +49,7 @@ class TurnActionPolicyTest {
 
     @Test
     void theCapResetsOnTheNextQuestion() {
-        InterviewSessionState nextQuestion = withFollowUps(afterOpening(), 3).withTurn(new TurnRecord("ok", "advance", "q2"));
+        InterviewSessionState nextQuestion = withFollowUps(afterOpening(), 2).withTurn(new TurnRecord("ok", "advance", "q2"));
 
         assertThat(TurnActionPolicy.allowedActions(nextQuestion)).containsExactly("follow_up", "advance", "end");
     }
@@ -61,19 +61,19 @@ class TurnActionPolicyTest {
                 .withTurn(new TurnRecord("a2", "advance", "q3"));
 
         assertThat(TurnActionPolicy.allowedActions(onLast)).containsExactly("follow_up", "end");
-        assertThat(TurnActionPolicy.allowedActions(withFollowUps(onLast, 3))).containsExactly("end");
+        assertThat(TurnActionPolicy.allowedActions(withFollowUps(onLast, 2))).containsExactly("end");
     }
 
     @Test
     void safetyCapIsTheMostExchangesTheOtherRulesAllowAndForcesEnd() {
-        assertThat(TurnActionPolicy.safetyCapExchanges(afterOpening())).isEqualTo(1 + 3 * 4);
+        assertThat(TurnActionPolicy.safetyCapExchanges(afterOpening())).isEqualTo(1 + 3 * 3);
 
-        // Worst case the other guards permit: every question gets 3 follow-ups before moving on.
-        InterviewSessionState state = withFollowUps(afterOpening(), 3);
-        state = withFollowUps(state.withTurn(new TurnRecord("x", "advance", "q2")), 3);
-        state = withFollowUps(state.withTurn(new TurnRecord("x", "advance", "q3")), 3);
-        // Opener + 3 × (3 follow-ups + 1 move-on) − the final move-on, which is the exchange being decided.
-        assertThat(TurnActionPolicy.currentExchange(state)).isEqualTo(13);
+        // Worst case the other guards permit: every question gets 2 follow-ups before moving on.
+        InterviewSessionState state = withFollowUps(afterOpening(), 2);
+        state = withFollowUps(state.withTurn(new TurnRecord("x", "advance", "q2")), 2);
+        state = withFollowUps(state.withTurn(new TurnRecord("x", "advance", "q3")), 2);
+        // Opener + 3 × (2 follow-ups + 1 move-on) − the final move-on, which is the exchange being decided.
+        assertThat(TurnActionPolicy.currentExchange(state)).isEqualTo(10);
         assertThat(TurnActionPolicy.followUpLimitReached(state)).isTrue();
         assertThat(TurnActionPolicy.allowedActions(state)).containsExactly("end");
         // The cap lands exactly on that final exchange — it never cuts short an interview the other
@@ -82,10 +82,10 @@ class TurnActionPolicyTest {
 
         // If the guards were bypassed (e.g. history from before they existed), the cap still stops it.
         InterviewSessionState runaway = afterOpening();
-        for (int i = 0; i < 11; i++) {
+        for (int i = 0; i < 8; i++) {
             runaway = runaway.withTurn(new TurnRecord("x", "advance", "clamped"));
         }
-        assertThat(TurnActionPolicy.currentExchange(runaway)).isEqualTo(13);
+        assertThat(TurnActionPolicy.currentExchange(runaway)).isEqualTo(10);
         assertThat(TurnActionPolicy.safetyCapReached(runaway)).isTrue();
         assertThat(TurnActionPolicy.allowedActions(runaway)).containsExactly("end");
     }
@@ -108,6 +108,35 @@ class TurnActionPolicyTest {
                 .mapToObj(i -> new InterviewQuestionDto("c", "q" + i, "r" + i)).toList();
 
         assertThat(TurnActionPolicy.safetyCapExchanges(InterviewSessionState.newSession("s", "a@test.com", seven)))
-                .isEqualTo(29);
+                .isEqualTo(22);
+    }
+
+    @Test
+    void followUpIsAllowedAtCountOneAndNotAtTwo() {
+        assertThat(TurnActionPolicy.allowedActions(withFollowUps(afterOpening(), 1))).contains("follow_up");
+        assertThat(TurnActionPolicy.allowedActions(withFollowUps(afterOpening(), 2))).doesNotContain("follow_up");
+    }
+
+    @Test
+    void theLastQuestionAllowsFollowUpOrEndBelowTheCap() {
+        InterviewSessionState onLast = afterOpening()
+                .withTurn(new TurnRecord("a1", "advance", "q2"))
+                .withTurn(new TurnRecord("a2", "advance", "q3"));
+
+        assertThat(TurnActionPolicy.allowedActions(onLast)).containsExactly("follow_up", "end");
+        assertThat(TurnActionPolicy.allowedActions(withFollowUps(onLast, 1))).containsExactly("follow_up", "end");
+    }
+
+    @Test
+    void theSafetyCapExchangeAllowsOnlyEnd() {
+        InterviewSessionState state = afterOpening();
+        while (TurnActionPolicy.currentExchange(state) < TurnActionPolicy.safetyCapExchanges(state) - 1) {
+            state = state.withTurn(new TurnRecord("x", "advance", "q"));
+        }
+        assertThat(TurnActionPolicy.allowedActions(state)).hasSizeGreaterThan(1);
+        state = state.withTurn(new TurnRecord("x", "advance", "q"));
+
+        assertThat(TurnActionPolicy.currentExchange(state)).isEqualTo(TurnActionPolicy.safetyCapExchanges(state));
+        assertThat(TurnActionPolicy.allowedActions(state)).containsExactly("end");
     }
 }

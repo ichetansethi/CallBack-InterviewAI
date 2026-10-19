@@ -61,7 +61,7 @@ class TurnDecisionPromptTest {
                 .withTurn(new TurnRecord("a", "follow_up", "f1"));
 
         assertThat(TurnDecisionService.buildTurnPrompt("b", state))
-                .contains("FOLLOW-UPS ALREADY ASKED ON THIS QUESTION: 1 of 3")
+                .contains("FOLLOW-UPS ALREADY ASKED ON THIS QUESTION: 1 of 2")
                 .contains("ALLOWED ACTIONS THIS TURN: follow_up, advance, end")
                 .doesNotContain("follow-up limit");
     }
@@ -71,11 +71,10 @@ class TurnDecisionPromptTest {
         InterviewSessionState state = InterviewSessionState.newSession("s", "a@test.com", THREE_QUESTIONS)
                 .withTurn(new TurnRecord("hi", "advance", "q1"))
                 .withTurn(new TurnRecord("a", "follow_up", "f1"))
-                .withTurn(new TurnRecord("b", "follow_up", "f2"))
-                .withTurn(new TurnRecord("c", "follow_up", "f3"));
+                .withTurn(new TurnRecord("b", "follow_up", "f2"));
 
-        assertThat(TurnDecisionService.buildTurnPrompt("d", state))
-                .contains("FOLLOW-UPS ALREADY ASKED ON THIS QUESTION: 3 of 3")
+        assertThat(TurnDecisionService.buildTurnPrompt("c", state))
+                .contains("FOLLOW-UPS ALREADY ASKED ON THIS QUESTION: 2 of 2")
                 .contains("ALLOWED ACTIONS THIS TURN: advance, end — the follow-up limit for this question is reached");
     }
 
