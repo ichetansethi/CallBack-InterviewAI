@@ -71,6 +71,21 @@
                         <parameters>true</parameters>
                     </configuration>
                 </plugin>
+                <plugin>
+                    <!-- spring-boot-starter-parent binds repackage; this repo imports only the Boot BOM,
+                         which carries dependency versions but not plugin versions or executions. Modules
+                         that declare the plugin get an executable jar; the rest stay plain jars. -->
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <version>${spring-boot.version}</version>
+                    <executions>
+                        <execution>
+                            <goals>
+                                <goal>repackage</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                </plugin>
             </plugins>
         </pluginManagement>
     </build>
