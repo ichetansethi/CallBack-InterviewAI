@@ -289,6 +289,37 @@ the custom `AuthenticationEntryPoint` (see `SecurityConfig`).
   `callback_admin` / `callback_password123`) — acceptable for a local-only Postgres instance
   where dev convenience outweighs the near-zero risk, unlike the JWT secret.
 
+- **Datasource URL is `${AUTH_DB_URL:jdbc:postgresql://localhost:5432/callback_auth}`**; compose sets
+  it to `jdbc:postgresql://postgres:5432/callback_auth`. `DB_USERNAME` / `DB_PASSWORD` are unchanged.
+- **Schema is managed by Flyway.** `src/main/resources/db/migration/V1__baseline.sql` is a schema-only dump
+  of the local `callback_auth` database; `ddl-auto` is `validate`, so Hibernate checks the schema and never
+  changes it. `spring.flyway.baseline-on-migrate: true` with `baseline-version: 1` adopts a database
+  Hibernate created earlier at V1 (it fails validation at startup if that database lacks a later
+  hand-applied change) and runs V1 on an empty one. New schema changes go in `V2__*.sql`; V1 is never edited.
+- **`users.id` is a UUID** (it was a `bigint`); that change is part of the V1 baseline, so the old
+  hand-run migration script is gone.
+- **Private key in Docker.** The key is excluded from the build context and every image
+  (`.dockerignore`) and mounted as a compose secret at `/run/secrets/jwt_private_key`, read through
+  `JWT_PRIVATE_KEY_PATH`. A key that fails to load shows up at **login**, not at startup.
+
+
+## Build and run (host and Docker)
+
+- **Packaging.** `auth-service` declares `spring-boot-maven-plugin`; its version (`${spring-boot.version}`) and
+  the `repackage` execution come from the root `pom.xml`'s `pluginManagement`. The parent imports the
+  Boot BOM instead of inheriting `spring-boot-starter-parent`, and a BOM carries dependency versions
+  only, so without that block the plugin had no version (Maven warned) and no execution, and the jar
+  was a plain one with no `Main-Class`. `mvn package` now produces `target/auth-service.jar` (via `<finalName>`),
+  an executable Boot jar: `java -jar auth-service/target/auth-service.jar`.
+- **Docker.** `docker/java-service.Dockerfile` builds any module (`--build-arg SERVICE=auth-service`,
+  `./mvnw -pl auth-service -am -DskipTests package`) and runs `java -jar /app/app.jar` as a non-root user
+  with the JVM as PID 1. `docker compose up --build` runs it with the rest of the stack; only the
+  gateway (8080) is published to the host.
+- **One config for both.** Every host the service talks to is a `${VAR:today's-default}` placeholder
+  in `application.yml`, so a host run needs no variables and compose supplies them. Placeholders are
+  used instead of Spring's relaxed binding because relaxed binding drops dashes from env var names
+  (`JD_RESUME_SERVICE_BASE_URL` does not bind to `jd-resume-service.base-url`).
+
 ---
 
 ## Pre-existing files (unchanged by the auth/JWT work)
@@ -313,6 +344,12 @@ Full flow tested against a local Postgres instance:
 | `GET /auth/me` (no token) | 401 | ✅ |
 | `GET /auth/me` (garbage token) | 401 | ✅ |
 | `POST /auth/login` (wrong password) | 401, body = "Invalid email or password" | ✅ |
+
+Re-verified 2026-10-19 in the compose stack, through the gateway on `:8080`: register 201 (UUID id),
+login 200 with an RS256 token whose signature verifies against the public key derived from the
+mounted private key, `/auth/me` 200 with the token and 401 without, wrong password 401. Also run
+as `java -jar` against an empty database: Flyway applied V1, `validate` passed, register 201 and
+login 200.
 
 ---
 

@@ -16,8 +16,52 @@ against retrieved evidence, and persists the resulting score + suggestions. `que
 is a downstream consumer of this service's `GET /compatibility/{id}` (added specifically for it —
 see `bb32797`).
 
-Runs on port `8083`, its own Postgres instance on port `5433` (database `callback_compatibility`
-— distinct from every other service's DB, per this system's one-database-per-service pattern).
+Runs on port `8083`, its own Postgres instance on port `5433` on the host (database `callback_compatibility`
+— distinct from every other service's DB, per this system's one-database-per-service pattern; in compose
+it is a database on the shared `postgres` container). `POST /compatibility/analyze` is asynchronous:
+see "Async analysis (Kafka)" below.
+
+## Async analysis (Kafka) — how a request actually flows today
+
+The "Request flow" diagram below is the **pipeline stage**, and it now runs in a Kafka listener, not
+in the HTTP request. The request path is short and the slow LLM work is queued:
+
+1. `POST /compatibility/analyze` → `CompatibilityAnalysisService.requestAnalysis(...)` fetches the JD
+   and resume text from jd-resume-service (so a bad id or token fails fast, synchronously), saves a
+   `CompatibilityAnalysis` row in status `PENDING`, and publishes an `AnalysisRequestedEvent` (ids,
+   owner, both texts) to `analysis-requested`, keyed by `ownerEmail`, waiting at most 5s for the ack.
+   The controller answers **202 Accepted** with `{analysisId, status}` and a `Location` header.
+   If the publish fails the row is marked `FAILED` ("Could not queue analysis") and the caller gets a 503.
+2. `AnalysisRequestedListener` consumes one record at a time, `AnalysisStateWriter` moves the row to
+   `IN_PROGRESS`, and `AnalysisPipeline` runs the flow below at the pace Groq's token-per-minute cap allows.
+   A redelivered event for a `COMPLETED` or `FAILED` row is skipped; one for an `IN_PROGRESS` row (a
+   crashed run) runs again from scratch.
+3. `GET /compatibility/{id}` returns the row: `status` is `PENDING | IN_PROGRESS | COMPLETED | FAILED`,
+   the four scores and `suggestions` are filled only when `COMPLETED`, and `failureReason` explains a
+   `FAILED` one (for example, "The AI provider's per-minute rate limit was still hit after retrying;
+   submit the analysis again later"). Another user's id is a 404, same as a missing one.
+
+**Failure handling.** The listener catches pipeline failures itself and records them as `FAILED`,
+because a redelivery would re-run the whole LLM pipeline against the same token budget. Only what
+escapes it (for example the database briefly down) reaches the Kafka error handler:
+
+- `DefaultErrorHandler` with `FixedBackOff(2s, 2 retries)`, then the record is published to
+  **`analysis-requested.DLT`** (3 partitions, the same partition number as the original), so it can be
+  inspected or replayed instead of vanishing from the log. A record that cannot be deserialized is
+  never retried, only dead-lettered, as the raw bytes it arrived as.
+- The destination is named explicitly (`.DLT`): the recoverer's default suffix differs between Spring
+  Kafka versions and pointed at a topic that did not exist. With broker auto-create off, each send
+  then blocked the consumer thread for the producer's 60s metadata wait.
+- The dead-letter producer is its own `KafkaTemplate` (value serializer that takes both bytes and
+  events) with `max.block.ms` 10s, so an unavailable broker fails in seconds.
+- Consumer: `max.poll.records` 1 and `max.poll.interval.ms` 10 min, because one analysis takes 1-2
+  minutes; with the defaults a few queued analyses would outlast the poll interval and be redelivered.
+- Both topics are created by `KafkaConfig` (the compose broker has auto-create off).
+
+**Groq's per-minute cap is the weak point on this account.** Verified 2026-10-19 through the gateway in
+Docker: the first analysis ended `FAILED` with exactly that reason after the retries ran out (HTTP 429 on
+`openai/gpt-oss-120b`); the embedding step had already worked. After the bucket drained, the same
+request reached `COMPLETED` (scores 92/90/88/86, one suggestion).
 
 ## Request flow
 
@@ -37,11 +81,11 @@ CompatibilityController.analyze(AnalyzeRequest{jdId, resumeId}, HttpServletReque
 CompatibilityAnalysisService.analyze(jdId, resumeId, ownerEmail, authorizationHeader)
       │
       ├─▶ JdResumeServiceClient.fetchJobDescriptionText(jdId, authHeader)
-      │        RestClient GET http://localhost:8082/jd/{jdId}/text   (Authorization forwarded verbatim)
+      │        RestClient GET ${JD_RESUME_SERVICE_URL}/jd/{jdId}/text   (Authorization forwarded verbatim)
       │        ⇒ jdText
       │
       ├─▶ JdResumeServiceClient.fetchResumeText(resumeId, authHeader)
-      │        RestClient GET http://localhost:8082/resumes/{resumeId}/text
+      │        RestClient GET ${JD_RESUME_SERVICE_URL}/resumes/{resumeId}/text
       │        ⇒ resumeText
       │
       ├─▶ RagRetrievalService.indexResumeIfAbsent(resumeId, resumeText)
@@ -122,7 +166,7 @@ public RestClient jdResumeServiceRestClient(RestClient.Builder builder,
   in it is reactive, so a blocking client is the natural fit and matches how Spring AI's own
   internal Ollama/Groq calls behave (also synchronous). No explicit connect/read timeout is
   configured — relies on the underlying `ClientHttpRequestFactory`'s defaults.
-- Base URL comes from `jd-resume-service.base-url` (`http://localhost:8082`) — a single
+- Base URL comes from `jd-resume-service.base-url` (`${JD_RESUME_SERVICE_URL:http://localhost:8082}`) — a single
   configured URL, no service discovery. Fine for a fixed local/dev topology; would need
   revisiting for a real multi-instance deployment.
 - Error translation is the interesting part — every upstream HTTP failure is mapped to a specific
@@ -255,7 +299,7 @@ spring.ai.model.embedding: ollama   # EmbeddingModel bean backed by the Ollama s
 ```
 
 ```yaml
-spring.ai.ollama.base-url: http://localhost:11434
+spring.ai.ollama.base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
 spring.ai.ollama.embedding.model: nomic-embed-text
 spring.ai.ollama.init.pull-model-strategy: never   # don't auto-pull the model on startup
 
@@ -330,19 +374,24 @@ spring:
   application:
     name: compatibility-service
   datasource:
-    url: jdbc:postgresql://localhost:5433/callback_compatibility
+    url: ${COMPATIBILITY_DB_URL:jdbc:postgresql://localhost:5433/callback_compatibility}
     username: ${DB_USERNAME:callback_admin}
     password: ${DB_PASSWORD:callback_password123}
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     open-in-view: false
+  flyway:
+    baseline-on-migrate: true
+    baseline-version: 1
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
   ai:
     model:
       chat: openai
       embedding: ollama
     ollama:
-      base-url: http://localhost:11434
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
       embedding:
         model: nomic-embed-text
       init:
@@ -363,8 +412,35 @@ spring:
 server:
   port: 8083
 jd-resume-service:
-  base-url: http://localhost:8082
+  base-url: ${JD_RESUME_SERVICE_URL:http://localhost:8082}
+compatibility:
+  kafka:
+    topic: analysis-requested
+    group-id: compatibility-service
+    listener:
+      auto-startup: true
 ```
+
+- **Variables (defaults are today's host values):** `COMPATIBILITY_DB_URL`, `KAFKA_BOOTSTRAP_SERVERS`,
+  `OLLAMA_BASE_URL`, `JD_RESUME_SERVICE_URL`, `GROQ_API_KEY` (no default). Compose sets the first four
+  to `postgres:5432`, `kafka:29092` (the in-network listener; `localhost:9092` is the host one),
+  `http://ollama:11434` and `http://jd-resume-service:8082`.
+- **Ollama runs in the compose stack by default.** The `ollama` service has no published port and a
+  named volume `ollama-data`; `ollama-pull` is a one-shot that pulls `nomic-embed-text` and exits, and
+  `compatibility-service` has `depends_on: ollama-pull: service_completed_successfully`, so it only
+  starts once the model is there. Verified: a request from another container to
+  `http://ollama:11434/api/embeddings` returned a 768-dimension vector, matching `dimensions: 768`.
+  That Ollama is CPU-only. To use the host's Ollama (Metal), set
+  `OLLAMA_BASE_URL=http://host.docker.internal:11434` in your local `.env` (kept out of `.env.example`);
+  `ollama` and `ollama-pull` still start and pull in that case, because the dependency is unconditional.
+
+- **Schema is managed by Flyway.** `db/migration/V1__baseline.sql` is a schema-only dump of the local
+  `callback_compatibility` database; `ddl-auto` is `validate`. `baseline-on-migrate` with
+  `baseline-version: 1` adopts a database Hibernate created earlier and runs V1 on an empty one. New
+  changes go in `V2__*.sql`; V1 is never edited. **V1 leaves out `vector_store` and the `vector`,
+  `hstore` and `uuid-ossp` extensions**: Spring AI's pgvector initializer creates the table, and a new
+  compatibility database still needs those extensions created once by a superuser (compose does it in
+  `docker/postgres-init.sql`, on the `pgvector/pgvector:pg16` image).
 
 Note the datasource port is **5433**, distinct from every other service's `5432` — this service's
 Postgres instance/schema (`callback_compatibility`) is fully separate infrastructure, not just a
@@ -383,7 +459,21 @@ test suite is the closest equivalent, and several tests hit real dependencies ra
 | `JdResumeServiceClientTest` | Bearer token forwarded verbatim on both text-fetch paths; upstream 401/404 map to the right local exceptions | `MockRestServiceServer` (no network) |
 | `RagRetrievalTest` | Retrieval discriminates topically (a backend query doesn't surface an unrelated "barista" chunk and vice versa); `indexResumeIfAbsent` is a true no-op on re-index | Real pgvector + real Ollama embeddings |
 | `CompatibilityScorerTest` | Well-covered JD produces in-range scores with non-blank suggestions; a genuine gap (e.g. Terraform/Ansible with zero evidence) reliably produces a suggestion naming that requirement; documents the llama3.2:3b → Groq precision improvement (see above) | Real Groq chat calls |
+| `AnalysisRequestedListenerTest` (7 tests) | Real broker + database: a garbage record lands on `analysis-requested.DLT`; a listener whose `startIfRunnable` throws is attempted 3 times, runs no pipeline and leaves one dead letter (it uses `startIfRunnable` because the listener catches pipeline failures itself and marks `FAILED`, so those never reach the error handler) | Real Kafka + Postgres |
 | `CompatibilityAnalysisServiceTest` | Full pipeline (jd-resume-service mocked, RAG + scorer real) surfaces a grounded suggestion for a genuine gap even against a short resume, where naive empty-evidence-as-signal would fail | jd-resume-service mocked via `@MockitoBean`; pgvector + Groq real |
+
+## Build and run (host and Docker)
+
+- **Packaging.** `compatibility-service` declares `spring-boot-maven-plugin`; its version
+  (`${spring-boot.version}`) and the `repackage` execution come from the root `pom.xml`'s
+  `pluginManagement` (the parent imports the Boot BOM, which carries no plugin versions or
+  executions, so before that block the jar had no `Main-Class`). `mvn package` produces
+  `target/compatibility-service.jar`, runnable with `java -jar`.
+- **Docker.** `docker/java-service.Dockerfile` (`--build-arg SERVICE=compatibility-service`) builds and
+  runs it as a non-root user; `docker compose up --build` starts it after postgres, kafka, redis and
+  `ollama-pull`. Redis and Kafka are published on `127.0.0.1` only.
+- **One config for both.** Hosts are `${VAR:default}` placeholders rather than Spring's relaxed binding,
+  which drops dashes from env var names.
 
 ---
 

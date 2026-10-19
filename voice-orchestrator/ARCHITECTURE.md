@@ -26,7 +26,7 @@ nothing to do with Spring AI.
 Runs on port `8085`. Landed whole in a single commit (`79eff1a`, "Added Voice Orchestrator and
 updated common security to accommodate ReactiveJwtAuthenticationFilter") that also introduced
 `common-security`'s `ReactiveJwtAuthenticationFilter` and a new `docker-compose.yml` running
-`redis:7-alpine` on port `6379`.
+`redis:7-alpine` on port `6379` (since bound to `127.0.0.1` only; see "Build and run").
 
 There is **no controller package, no `SecurityConfig`, and no REST endpoint** in this module —
 the WebSocket handler is the only entry point.
@@ -203,7 +203,7 @@ binary frame arrives
 UtteranceBuffer.append(chunk)
    accumulates raw PCM bytes; computes chunkMs from byte length @ 16kHz/16-bit
    VoiceActivityDetector.isSilent(chunk) → tracks running speechMs / silenceMs
-   returns true (flush) only once speechMs >= 300ms AND silenceMs >= 700ms
+   returns true (flush) only once speechMs >= 300ms AND silenceMs >= 1500ms (SILENCE_HOLD_MS)
       (guards against flushing on leading silence before the candidate has said anything)
    │  (false → wait for more chunks)
    ▼ (true)
@@ -644,10 +644,10 @@ spring:
     name: voice-orchestrator
   data:
     redis:
-      host: localhost
-      port: 6379
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     admin:
       operation-timeout: 5s
       close-timeout: 2s
@@ -667,7 +667,7 @@ piper:
   base-url: ${PIPER_BASE_URL:http://localhost:8091}
 services:
   question-service:
-    base-url: http://localhost:8084
+    base-url: ${QUESTION_SERVICE_URL:http://localhost:8084}
 session-history:
   kafka:
     topic: session-completed
@@ -677,8 +677,9 @@ turn-decision:
 
 - `spring.data.redis.host`/`port` — targets the `redis:7-alpine` container added by
   `docker-compose.yml` in the same commit (container name `callback-redis`, port-mapped
-  `6379:6379`). No password configured — an unauthenticated local Redis, acceptable for local dev
-  only.
+  `127.0.0.1:6379:6379`; `REDIS_HOST` / `REDIS_PORT` override it, and compose sets `REDIS_HOST=redis`).
+  No password configured — an unauthenticated Redis, which is why the host port is bound to loopback
+  only: acceptable for local dev, not for a LAN.
 - `spring.ai.openai.*` — same Groq-via-OpenAI-compatible-client pattern as every other Groq-backed
   service here: `api-key` from `${GROQ_API_KEY}` only (no literal fallback), model
   `openai/gpt-oss-120b`, low temperature (`0.2`) appropriate for a structured tool-call decision
@@ -687,12 +688,14 @@ turn-decision:
   `WhisperClientConfig`/`PiperClientConfig`'s respective `WebClient` beans. These point at local
   server-mode instances of whisper.cpp and Piper — infrastructure entirely outside Spring AI's
   model abstractions. Overridable with `WHISPER_BASE_URL` / `PIPER_BASE_URL`, defaulting to the
-  local ports. Run whisper.cpp on the host rather than in Docker: Docker Desktop's Linux VM has no
+  local ports; in compose they default to `http://whisper:8090` / `http://piper:8091`. Run whisper.cpp on the host rather than in Docker: Docker Desktop's Linux VM has no
   Metal, so a container is CPU-only — measured 2026-10-17 on jfk.wav (base.en, `/inference`):
   ~85-120ms on the host (Metal) vs ~810-980ms in a CPU-only container.
 - `services.question-service.base-url` — same `@Value`-into-`WebClient` pattern, injected into
-  `QuestionServiceClient`. Port `8084` matches question-service's own `application.yml`.
-- `spring.kafka.bootstrap-servers` — docker-compose's `callback-kafka` host listener.
+  `QuestionServiceClient`. It is `${QUESTION_SERVICE_URL:http://localhost:8084}`, the same variable
+  name the gateway and the other services use for question-service.
+- `spring.kafka.bootstrap-servers` — `${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}`: docker-compose's `callback-kafka` host listener by default,
+  and compose sets `kafka:29092`, the in-network listener (`localhost:9092` inside a container is the container itself).
   `spring.kafka.admin.*` bounds startup-time topic creation (see "Hand-off to
   session-history-service"). `session-history.kafka.topic` is the topic name, shared by the
   `NewTopic` bean and `SessionCompletedPublisher`.
@@ -752,6 +755,9 @@ once, against a real local stack, not by a repeatable test suite.
 | **Cursor fix re-run (2026-09-30)** | **Pass for the fix**: one connection, 8 exchanges, clean 1000 close, 16 turns published, Redis cleared, feedback stored. Opener asked Q1 with Q1's rationale; every coach turn's rationale matched the question actually being discussed. Only Q1–Q3 were reached — four follow-ups on Q2 (scripted answers couldn't adapt to them) used up the 8-exchange cap (item 10). No 429 occurred, so the turn budget was only exercised by `TurnDecisionRateLimitTest`. |
 | **Follow-up cap live run (2026-09-30)**: 3-question fixture set, vague answers on Q1 | **Pass**: all 3 questions covered in 9 exchanges on one connection (clean 1000 close); follow-up count reset on every advance; Q3 (last) took 3 follow-ups, leaving `end` the only allowed action, and the model ended; rationales matched on every coach turn; 18 turns published, Redis cleared, feedback stored. No guard rejection was needed — the model stayed within the listed actions. The mid-question cap wasn't hit live (the model advanced on its own after one follow-up) — covered by `TurnDecisionServiceTest`/`TurnDecisionGuardTest`. |
 | Clean interview end state | Was entirely missing (no `"end"` action existed); added and verified live across 3 sessions — model chose `"end"` on an explicit candidate cue each time, WebSocket closed with code 1000 (normal closure) each time. The later turn-count-in-prompt change (see "Reaching a clean end state") has **not yet** been re-verified live |
+| **Container pass through the gateway (2026-10-19)**: compose stack, `ws://localhost:8080/voice/session`, CPU-only whisper container, scripted `say` audio at 16 kHz | **Pass for the pipeline, not for coverage.** Handshake ack, whisper transcripts accurate (one miss: "idempotent" heard as "eat empotent"), reply audio valid (22.05 kHz mono WAV, 1-3 frames per reply), reconnect with the same token + `questionSetId` resumed the Redis session, and the model chose `"end"` on a wrap-up cue (socket 1000, `session-completed` published, Redis key deleted, `/sessions` showed a `COMPLETED` session with a 14-turn transcript and feedback). Whisper alone took 0.9-1.3s for a 12s utterance (measured on the compose network). The container has `SILENCE_HOLD_MS = 1500` compiled in (checked with `javap` on the jar copied out of the running container; it is a constant, not an env var). |
+| **Question coverage, container (2026-10-19)**: 7-question set, answers written for each question, no closing cue | **Q7 was never reached; no `"end"` without a cue.** Each question drew 2 follow-ups and then an `advance` on the third answer (the follow-up cap works), even on strong matched answers, so the first 19 exchanges covered Q1-Q6 and an interview that covers all 7 needs roughly 20+ exchanges. That is well past `TARGET_MAX_EXCHANGES = 8`, which is prompt guidance only; the model did not end by exchange 8 or at 19. In the first run (7 exchanges, closing cue sent) only Q1 and Q2 were asked. Exchanges past ~19 failed: the log shows 81 HTTP 429s (Groq tokens-per-minute cap, `openai/gpt-oss-120b`), `turnCount` stuck at 19 and 12 of 18 utterances in the last run got the fallback error frame after 14-20s of retries; the session stayed open in Redis. The growing history in each turn prompt is a likely contributor, not confirmed. |
+| Reply latency in the container (2026-10-19) | 2.1-4.8s from the **flush** (end of the 1.5s silence) to first reply audio, over 18 clean turns across three runs (failed turns excluded); add 1.5s for time from the end of speech. Not directly comparable to the `median ~3.1s, range 2.5-4.5s` row above, whose clock start isn't recorded and which ran whisper with Metal on the host. Includes whisper (~1s here), the Groq turn decision and Piper; the split between the last two was not measured. |
 
 This table is a point-in-time record of one manual pass, not a substitute for the automated tests
 this section still lacks — update or re-verify it the next time this pipeline is tested live.
@@ -815,6 +821,27 @@ this section still lacks — update or re-verify it the next time this pipeline 
     Without it Spring AI sends `submitTurnDecision`'s parameters to the model as `arg0`/`arg1`
     instead of `action`/`responseText`; `TurnDecisionRateLimitTest` asserts the real names so a
     lost flag fails the build.
+
+## Build and run (host and Docker)
+
+- **Packaging.** `voice-orchestrator` declares `spring-boot-maven-plugin`; its version
+  (`${spring-boot.version}`) and the `repackage` execution come from the root `pom.xml`'s
+  `pluginManagement` (the parent imports the Boot BOM, which carries dependency versions only, so
+  before that block the jar had no `Main-Class`). `mvn package` produces
+  `target/voice-orchestrator.jar`, runnable with `java -jar`.
+- **Docker.** `docker/java-service.Dockerfile` (`--build-arg SERVICE=voice-orchestrator`) builds and
+  runs it as a non-root user; `docker compose up --build` runs it with Redis, Kafka, the other
+  services, whisper.cpp and Piper. Only the gateway (8080) is published; the WebSocket is reached at
+  `ws://localhost:8080/voice/session?...`, and the gateway raises Reactor Netty's WebSocket frame cap
+  to 2 MB because one Piper sentence is a frame of 300 KB or more.
+- **Exposure.** Redis (`127.0.0.1:6379`), Kafka (`127.0.0.1:9092`) and Postgres (`127.0.0.1:5436`) are
+  bound to loopback only. Redis has no password and holds session state and the gateway's rate-limit
+  counters, so it must not be reachable from the LAN. Host runs still use `localhost`; containers use
+  the compose names.
+- **Sidecars, pinned.** whisper.cpp is built from commit `642b5d3260e020c2fc6f34a9569d10ddd7672963`
+  (the local checkout, `v1.9.3-78-g642b5d32`; `WHISPER_COMMIT` build arg, fetched shallow by SHA) with
+  `base.en` baked in, serving on 8090. Piper is the official server from `piper-tts[http]==1.8.0` with
+  `en_US-lessac-medium`, serving on 8091. Containerized whisper is CPU-only (see the whisper note above).
 
 ---
 

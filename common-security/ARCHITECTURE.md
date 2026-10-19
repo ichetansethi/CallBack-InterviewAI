@@ -287,6 +287,15 @@ prioritizing — a unit test suite here (valid/expired/malformed/wrong-signature
 `JwtValidator`; both filters' pass-through and context-population behavior in isolation) would
 catch a regression here before it silently breaks authentication across every consumer at once.
 
+## Packaging — a plain library jar, on purpose
+
+`common-security` does **not** declare `spring-boot-maven-plugin`, so it stays a plain library jar
+(verified: no `BOOT-INF` entries in `target/common-security-*.jar`). The root `pom.xml` puts the plugin
+and its `repackage` execution in `pluginManagement` only, which configures it without activating it, and
+only the runnable services declare it. If this module declared the plugin it would inherit
+`repackage`, and every service depending on it would get a Boot-layout jar on its classpath and break.
+The services' fat jars bundle this jar, public key included.
+
 ---
 
 ## Git history

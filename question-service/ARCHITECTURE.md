@@ -38,13 +38,13 @@ QuestionSetController.generate(@Valid QuestionGenerateRequest, @RequestHeader Au
 QuestionSetService.generate(request, ownerEmail, bearerToken)
       │
       ├─▶ JdResumeClient.getJdText(jdId, bearerToken)
-      │        RestClient GET http://localhost:8082/jd/{jdId}/text  (Authorization forwarded verbatim)
+      │        RestClient GET ${JD_RESUME_SERVICE_URL}/jd/{jdId}/text  (Authorization forwarded verbatim)
       │        ⇒ jdText
       │        404/401/other → UpstreamNotFoundException / UpstreamUnauthorizedException / UpstreamServiceException(502)
       │
       ├─▶ (only if request.compatibilityAnalysisId() != null)
       │     CompatibilityClient.getAnalysis(compatibilityAnalysisId, bearerToken)
-      │          RestClient GET http://localhost:8083/compatibility/{id}  (Authorization forwarded)
+      │          RestClient GET ${COMPATIBILITY_SERVICE_URL}/compatibility/{id}  (Authorization forwarded)
       │          ⇒ CompatibilityAnalysisResponse
       │          .uncoveredRequirements() → List<String> of jdRequirement values from its suggestions
       │     else: uncoveredRequirements = List.of()
@@ -294,7 +294,10 @@ would surface as an unhandled 500, since it carries no `@ResponseStatus`.
 - `QuestionSetRepository` — one derived query, `findByOwnerEmail`.
 - `InterviewQuestionRepository` — one derived query,
   `findByQuestionSetIdOrderByOrderIndexAsc`.
-- No Flyway/Liquibase — `ddl-auto: update`, same as every other service in this system.
+- Schema is managed by Flyway (`db/migration/V1__baseline.sql`, a schema-only dump of the local
+  `callback_question` database) with `ddl-auto: validate`; `baseline-on-migrate` + `baseline-version: 1`
+  adopts a Hibernate-created database at V1 and runs V1 on an empty one. New changes go in
+  `V2__*.sql`; V1 is never edited.
 
 **Known loose end**: `orderIndex` is declared on `InterviewQuestion` but never explicitly set
 anywhere in `QuestionSetService` — every persisted row gets the JPA default of `0`. The
@@ -333,13 +336,16 @@ spring:
   application:
     name: question-service
   datasource:
-    url: jdbc:postgresql://localhost:5432/callback_question
+    url: ${QUESTION_DB_URL:jdbc:postgresql://localhost:5432/callback_question}
     username: ${DB_USERNAME:callback_admin}
     password: ${DB_PASSWORD:callback_password123}
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     open-in-view: false
+  flyway:
+    baseline-on-migrate: true
+    baseline-version: 1
   ai:
     model:
       chat: openai
@@ -354,9 +360,9 @@ spring:
 server:
   port: 8084
 jd-resume-service:
-  base-url: http://localhost:8082
+  base-url: ${JD_RESUME_SERVICE_URL:http://localhost:8082}
 compatibility-service:
-  base-url: http://localhost:8083
+  base-url: ${COMPATIBILITY_SERVICE_URL:http://localhost:8083}
 ```
 
 - `spring.ai.model.chat: openai` / `embedding: none` — selects the OpenAI-compatible chat model
@@ -364,12 +370,31 @@ compatibility-service:
   embedding model pointed at Groq, which has no embeddings endpoint.
 - `GROQ_API_KEY` — env var only, no literal fallback, same convention as every other Groq-backed
   service in this system.
+- **Variables (defaults are today's host values):** `QUESTION_DB_URL`, `JD_RESUME_SERVICE_URL`,
+  `COMPATIBILITY_SERVICE_URL`, `GROQ_API_KEY` (no default). Compose sets them to `postgres:5432/callback_question`,
+  `http://jd-resume-service:8082` and `http://compatibility-service:8083`. The Groq base URL is a fixed
+  external endpoint and stays literal.
 - `jd-resume-service.base-url` and `compatibility-service.base-url` are both configured — this is
   the only service in the system with two outbound base URLs. There is no `auth-service.base-url`
   anywhere — this service never calls auth-service directly; JWT verification happens locally via
   `common-security`.
 - No `/health` endpoint or controller exists in this module, unlike compatibility-service's
   dedicated `HealthController`.
+
+## Build and run (host and Docker)
+
+- **Packaging.** `question-service` declares `spring-boot-maven-plugin`; its version (`${spring-boot.version}`) and the
+  `repackage` execution come from the root `pom.xml`'s `pluginManagement` (the parent imports the Boot
+  BOM, which carries dependency versions only, so before that block the jar had no `Main-Class`).
+  `mvn package` produces `target/question-service.jar`, runnable with `java -jar`.
+- **Docker.** `docker/java-service.Dockerfile` (`--build-arg SERVICE=question-service`) builds and runs it as a
+  non-root user; `docker compose up --build` starts it with the rest of the stack.
+- **One config for both.** Hosts are `${VAR:default}` placeholders rather than Spring's relaxed binding,
+  which drops dashes from env var names.
+
+Verified 2026-10-19 through the gateway in Docker (after a completed compatibility analysis): `POST /questions/generate`
+with the JD id and the analysis id returned 201 with 7 questions (technical, behavioral, role-specific) that
+tracked the JD and the analysis's mentoring suggestion; `GET /questions/{id}` returned 200 with the same 7.
 
 ---
 

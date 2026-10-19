@@ -155,8 +155,8 @@ extraction happens as a second step after the entity is constructed, inside
 Both repositories are plain `JpaRepository<Entity, UUID>` with one derived query each —
 `findByOwnerEmail(String)`. No pagination, no soft-delete, no custom `@Query`.
 
-`ddl-auto: update` — Hibernate auto-migrates schema at boot; no Flyway/Liquibase in this service,
-same as auth-service.
+Schema is managed by Flyway (`db/migration/V1__baseline.sql`) with `ddl-auto: validate`; see
+"`application.yml`" below.
 
 ---
 
@@ -231,13 +231,16 @@ spring:
   application:
     name: jd-resume-service
   datasource:
-    url: jdbc:postgresql://localhost:5432/callback_jdresume
+    url: ${JD_RESUME_DB_URL:jdbc:postgresql://localhost:5432/callback_jdresume}
     username: ${DB_USERNAME:callback_admin}
     password: ${DB_PASSWORD:callback_password123}
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     open-in-view: false
+  flyway:
+    baseline-on-migrate: true
+    baseline-version: 1
   servlet:
     multipart:
       max-file-size: 10MB
@@ -251,8 +254,40 @@ server:
 - **`open-in-view: false`** — no lazy-loading outside a transaction is possible from controllers.
   Consistent with the code: all entity access happens inside `@Service` methods, fully mapped to
   DTOs before reaching the controller layer.
+- **Datasource URL** is `${JD_RESUME_DB_URL:…}`; compose sets it to
+  `jdbc:postgresql://postgres:5432/callback_jdresume`.
+- **Schema is managed by Flyway.** `src/main/resources/db/migration/V1__baseline.sql` is a schema-only dump
+  of the local `callback_jdresume` database; `ddl-auto` is `validate`, so Hibernate checks the schema and never
+  changes it. `spring.flyway.baseline-on-migrate: true` with `baseline-version: 1` adopts a database
+  Hibernate created earlier at V1 (it fails validation at startup if that database lacks a later
+  hand-applied change) and runs V1 on an empty one. New schema changes go in `V2__*.sql`; V1 is never edited.  The H2 test profile (`application-test.yml`) turns Flyway off, because V1 is Postgres SQL; that is
+  why the only test here cannot catch a migration problem. Boot the app against Postgres to check one.
+
+- **Uploaded files** go to `./data/resumes` relative to the working directory. In Docker that is
+  `/app/data/resumes`, on the named volume `resume-data` (mounted at `/app/data`), owned by the
+  non-root `app` user. Verified 2026-10-19: upload through the gateway (201), the file listed in the
+  container, `docker compose up -d --force-recreate jd-resume-service`, the same file still there and
+  `GET /resumes/{id}/text` still 200. `docker compose down -v` deletes it.
 - DB credential defaults mirror auth-service's — acceptable for a local-only dev Postgres
   instance, same rationale documented there.
+
+
+## Build and run (host and Docker)
+
+- **Packaging.** `jd-resume-service` declares `spring-boot-maven-plugin`; its version (`${spring-boot.version}`) and
+  the `repackage` execution come from the root `pom.xml`'s `pluginManagement`. The parent imports the
+  Boot BOM instead of inheriting `spring-boot-starter-parent`, and a BOM carries dependency versions
+  only, so without that block the plugin had no version (Maven warned) and no execution, and the jar
+  was a plain one with no `Main-Class`. `mvn package` now produces `target/jd-resume-service.jar` (via `<finalName>`),
+  an executable Boot jar: `java -jar jd-resume-service/target/jd-resume-service.jar`.
+- **Docker.** `docker/java-service.Dockerfile` builds any module (`--build-arg SERVICE=jd-resume-service`,
+  `./mvnw -pl jd-resume-service -am -DskipTests package`) and runs `java -jar /app/app.jar` as a non-root user
+  with the JVM as PID 1. `docker compose up --build` runs it with the rest of the stack; only the
+  gateway (8080) is published to the host.
+- **One config for both.** Every host the service talks to is a `${VAR:today's-default}` placeholder
+  in `application.yml`, so a host run needs no variables and compose supplies them. Placeholders are
+  used instead of Spring's relaxed binding because relaxed binding drops dashes from env var names
+  (`JD_RESUME_SERVICE_BASE_URL` does not bind to `jd-resume-service.base-url`).
 
 ---
 
