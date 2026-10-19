@@ -42,3 +42,5 @@ build/
 .DS_Store
 ### Docker compose secrets/config ###
 .env
+
+common-security/src/main/resources/keys/public_key.pem
