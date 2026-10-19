@@ -7,8 +7,14 @@ spring:
     password: ${DB_PASSWORD:callback_password123}
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     open-in-view: false
+  flyway:
+    # Databases first created by Hibernate's old ddl-auto: update already have V1's tables, so they
+    # are adopted at V1 instead of failing on "table already exists". On an empty database V1 runs.
+    # If such a database lacks a later hand-applied change, ddl-auto: validate refuses to start.
+    baseline-on-migrate: true
+    baseline-version: 1
   http:
     client:
       # Spring AI's OpenAI client is built from Boot's RestClient.Builder; without a read timeout a

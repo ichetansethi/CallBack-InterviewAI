@@ -4,6 +4,8 @@ spring:
     driver-class-name: org.h2.Driver
     username: sa
     password:
+  flyway:
+    enabled: false  # H2 + create-drop; V1 is Postgres SQL
   jpa:
     hibernate:
       ddl-auto: create-drop
